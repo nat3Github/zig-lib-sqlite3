@@ -4,7 +4,7 @@
 
 zig (version 0.13 was used in this code)
 
-# build
+# build:
 
 zig build
 
