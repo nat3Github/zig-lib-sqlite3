@@ -1,4 +1,4 @@
-# -> compiles the c sqlite database
+# -> compiles static sqlite3 database
 
 # needs:
 
