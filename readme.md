@@ -8,7 +8,7 @@ zig (version 0.13 was used in this code)
 
 zig build
 
-# -> makes a zig module which can be included as follows:
+# -> also available as zig module:
 
 ### usually you add this package to the package manager (url = the ref of this repo that you want to use!):
 
