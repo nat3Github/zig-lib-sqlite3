@@ -10,7 +10,7 @@ zig build
 
 # -> makes a zig module which can be included as follows:
 
-### usually you add this package to the package manager:
+### usually you add this package to the package manager (url = the ref of this repo that you want to use!):
 
 .dependencies = .{
 .@"sqlite3-zig" = .{
