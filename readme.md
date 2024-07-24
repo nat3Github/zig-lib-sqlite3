@@ -28,5 +28,5 @@ const sqlite3 = b.dependency("sqlite3-zig", .{
 const sqlite_module = sqlite3.module("sqlite3-zig");
 exe.root_module.addImport("sqlite3-zig", sqlite_module);
 
-then in your main.zig:
+### then in your main.zig:  
 @import(sqlite3-zig);
