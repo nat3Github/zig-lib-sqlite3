@@ -1,4 +1,4 @@
-# -> compiles static sqlite3 database
+# -> compiles static sqlite3 database (as of now version 3.46.0)
 
 # needs:
 
