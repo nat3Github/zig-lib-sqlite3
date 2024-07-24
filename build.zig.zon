@@ -7,7 +7,7 @@
         "build.zig.zon",
         "sqlite-src",
         "src",
-        "LICENSE",
+        // "LICENSE",
         "README.md",
     },
 }
