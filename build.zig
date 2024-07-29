@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) void {
 
     // this will not compile a static lib but your executable will do the compilation if you import this as a module
 
-    const module = b.addModule("sqlite3-zig", .{ .root_source_file = b.path("src/sqlite.zig") });
+    const module = b.addModule("sqlite3", .{ .root_source_file = b.path("src/sqlite.zig") });
     module.link_libc = true;
     module.addIncludePath(b.path("sqlite-src"));
     module.addCSourceFile(.{ .file = b.path("sqlite-src/sqlite3.c") });
