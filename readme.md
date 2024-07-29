@@ -1,16 +1,16 @@
-# -> compiles the c sqlite database
+# -> compiles static sqlite3 database (as of now version 3.46.0)
 
 # needs:
 
 zig (version 0.13 was used in this code)
 
-# build
+# build:
 
 zig build
 
-# -> makes a zig module which can be included as follows:
+# -> also available as zig module:
 
-### usually you add this package to the package manager:
+### usually you add this package to the package manager (url = the ref of this repo that you want to use!):
 
 .dependencies = .{
 .@"sqlite3-zig" = .{
@@ -28,5 +28,5 @@ const sqlite3 = b.dependency("sqlite3-zig", .{
 const sqlite_module = sqlite3.module("sqlite3-zig");
 exe.root_module.addImport("sqlite3-zig", sqlite_module);
 
-then in your main.zig:
+### then in your main.zig:  
 @import(sqlite3-zig);
