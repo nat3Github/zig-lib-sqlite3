@@ -1,7 +1,8 @@
 .{
-    .name = "sqlite3",
+    .name = .sqlite3,
     .version = "0.0.0",
     .dependencies = .{},
+    .fingerprint = 0x6edcd711f54f8509,
     .paths = .{
         "build.zig",
         "build.zig.zon",

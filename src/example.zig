@@ -1,5 +1,5 @@
 const std = @import("std");
-const dbs = @import("sqlite3-zig");
+const dbs = @import("sqlite3-zig").c;
 pub fn main() !void {
     var dbhandle: ?*dbs.sqlite3 = undefined;
     defer {
