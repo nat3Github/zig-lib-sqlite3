@@ -66,22 +66,6 @@ const sql = struct {
         ;
         return std.fmt.comptimePrint(insert_statement, .{ table_name, values });
     }
-    // fn primary_key(comptime body: []const u8) [:0]const u8 {
-    //     const PRIMARY_KEY =
-    //         \\PRIMARY KEY (
-    //         \\{s}
-    //         \\)
-    //     ;
-    //     std.fmt.comptimePrint(PRIMARY_KEY, .{body});
-    // }
-    // fn foreign_key(comptime body: []const u8) [:0]const u8 {
-    //     const FOREIGN_KEY =
-    //         \\FOREIGN KEY (
-    //         \\{s}
-    //         \\) REFERENCES {} ({}) {}
-    //     ;
-    //     std.fmt.comptimePrint(FOREIGN_KEY, .{body});
-    // }
 
     const Action = enum {
         Cascade,
@@ -117,77 +101,93 @@ test "test coerce [*c]u8 to [:0]const u8" {
     const coerce2: ?[*]?[*:0]const u8 = @ptrCast(coerce1);
     _ = coerce2;
 }
+
+const TestDb = struct {
+    db: Conn,
+    sinsert: PreparedStatement,
+    count: PreparedStatement,
+    count_where_y: PreparedStatement,
+    fn init() !@This() {
+        const MyStruct = struct {
+            x: f32,
+            y: i32,
+            data: []const u8,
+        };
+        var db = try Conn.init("./test1.db");
+
+        const create_mystruct = comptime sql.simple_table_from_struct(MyStruct, sql.type_name_as_str(MyStruct));
+        try db.execute(create_mystruct, void, void_ptr, no_op);
+
+        const xinsert = comptime sql.insert("mystruct",
+            \\?,
+            \\?,
+            \\?
+        );
+        const sinsert = try db.prepare_statement(xinsert);
+
+        // NOTE: indices of ?NNN must be between ?1 and ?32766
+        const select_where =
+            \\SELECT COUNT(*) as Entries
+            \\FROM
+            \\mystruct
+            \\where y = ?1;
+        ;
+        const where_x_equals = try db.prepare_statement(select_where);
+
+        const count =
+            \\SELECT COUNT(*) as Entries
+            \\FROM
+            \\mystruct;
+        ;
+        const scount = try db.prepare_statement(count);
+
+        return @This(){
+            .db = db,
+            .sinsert = sinsert,
+            .count = scount,
+            .count_where_y = where_x_equals,
+        };
+    }
+    pub fn deinit(self: *@This()) void {
+        self.count.deinit();
+        self.count_where_y.deinit();
+        self.sinsert.deinit();
+        self.db.deinit();
+    }
+    fn insert(self: *@This(), x: f32, y: i32, data: []const u8) !void {
+        try self.sinsert.bind_f64(1, x);
+        _ = .{ data, y };
+        try self.sinsert.bind_i32(2, y);
+        try self.sinsert.bind_text_u8(3, data);
+        try self.sinsert.exec(void, void_ptr, no_op2);
+    }
+    fn print_count_all(self: *@This()) !void {
+        try self.count.exec(void, void_ptr, print_count);
+    }
+    fn print_count_where_y(self: *@This(), val: i32) !void {
+        try self.count_where_y.bind_i32(1, val);
+        try self.count_where_y.exec(void, void_ptr, print_count);
+    }
+    fn print_count(_: *void, stmt: *c.sqlite3_stmt) void {
+        const cols = namespace_stmt.column_count(stmt);
+        assert(cols == 1);
+        const count = namespace_stmt.column_i32(stmt, 0);
+        std.log.warn("count: {}", .{count});
+    }
+};
+
 test "test sqlite3 table from struct" {
-    const MyStruct = struct {
-        x: f32,
-        y: i32,
-        data: []const u8,
-    };
-    var db = try Conn.init("./test1.db");
-    defer db.deinit();
-
-    const select_all =
-        \\SELECT *
-        \\FROM
-        \\mystruct;
-    ;
-    // const create_with_dtypes =
-    //     \\CREATE TABLE
-    //     \\IF NOT EXISTS MyStruct (
-    //     \\x FLOAT,
-    //     \\y INT,
-    //     \\data
-    //     \\);
-    // ;
-    // try db.execute(create_with_dtypes, void, void_ptr, no_op);
-    // _ = .{MyStruct};
-
-    const create_mystruct = comptime sql.simple_table_from_struct(MyStruct, sql.type_name_as_str(MyStruct));
-    try db.execute(create_mystruct, void, void_ptr, no_op);
-
-    // std.log.warn("{s}", .{create_mystruct});
-
-    // const insert = comptime sql.insert("mystruct",
-    //     \\1.0,
-    //     \\2,
-    //     \\"hello"
-    // );
-    // try db.execute(insert, void, void_ptr, no_op);
-
-    // const select_count =
-    //     \\SELECT COUNT(*) as Entries
-    //     \\FROM
-    //     \\mystruct
-    //     \\where y = 2;
-    // ;
-    // try db.execute(select_count, void, void_ptr, print_row_result);
-
-    // NOTE: indices of ?NNN must be between ?1 and ?32766
-    const select_where =
-        \\SELECT COUNT(*) as Entries
-        \\FROM
-        \\mystruct
-        \\where y = ?1;
-    ;
-
-    var where_x_equals = try db.prepare_statement(select_where);
-    try where_x_equals.bind_i32(1, 2);
-    try where_x_equals.exec(void, void_ptr, print_count);
-    defer where_x_equals.deinit();
-
-    _ = .{select_all};
-    // std.log.warn("simple table sql definition: {s}", .{MyStruct});
-}
-
-fn print_count(_: *void, stmt: *c.sqlite3_stmt) void {
-    const cols = namespace_stmt.column_count(stmt);
-    assert(cols == 1);
-    const count = namespace_stmt.column_i32(stmt, 0);
-    std.log.warn("count: {}", .{count});
+    var testdb = try TestDb.init();
+    defer testdb.deinit();
+    // try testdb.insert(7, 4, "hello peter");
+    try testdb.print_count_all();
+    try testdb.print_count_where_y(4);
+    // try testdb.print_count_where_y(0);
 }
 
 pub const void_ptr: *void = @constCast(&{});
 pub fn no_op(_: *void, _: []const ?[*:0]const u8, _: []const ?[*:0]const u8) !void {}
+pub fn no_op2(_: *void, _: *c.sqlite3_stmt) void {}
 
 fn print_row_result(_: *void, column_name: []const ?[*:0]const u8, column_text: []const ?[*:0]const u8) !void {
     for (column_name, column_text) |col, e| {
@@ -202,6 +202,7 @@ pub fn errify(err: c_int) !void {
         return e;
     };
 }
+
 pub fn errify2(err: c_int) !void {
     return switch (err) {
         101 => {}, //sqlite done
