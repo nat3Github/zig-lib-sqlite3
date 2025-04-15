@@ -359,7 +359,7 @@ pub const PreparedStatement = struct {
         return namespace_stmt.column_blob_or_utf8_bytes(self.pstmt, column_index);
     }
 
-    pub fn column_text_u8(self: *@This(), column_index: usize) [*:0]const u8 {
+    pub fn column_text_u8(self: *@This(), column_index: usize) []const u8 {
         return namespace_stmt.column_text_u8(self.pstmt, column_index);
     }
 
