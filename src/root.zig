@@ -9,7 +9,7 @@ const panic = std.debug.panic;
 const Allocator = std.mem.Allocator;
 const Type = std.builtin.Type;
 
-const sql = struct {
+pub const sql = struct {
     pub fn comptime_join(comptime list: []const []const u8, sep: []const u8) []const u8 {
         comptime {
             var s: []const u8 = "";
@@ -21,14 +21,14 @@ const sql = struct {
             return s;
         }
     }
-    fn ending_after_last_dot_comptime(comptime str: []const u8) []const u8 {
+    pub fn ending_after_last_dot_comptime(comptime str: []const u8) []const u8 {
         comptime var pos: usize = 0;
         inline while (comptime std.ascii.indexOfIgnoreCasePos(str, pos, ".")) |p| pos = p + 1;
         return str[pos..];
     }
 
     // NOTE: sqlite doesnt require data types
-    fn simple_table_from_struct(comptime T: type, table_name: []const u8) [:0]const u8 {
+    pub fn simple_table_from_struct(comptime T: type, table_name: []const u8) [:0]const u8 {
         const fields = @typeInfo(T).@"struct".fields;
         comptime {
             var list: [fields.len][]const u8 = undefined;
@@ -39,13 +39,13 @@ const sql = struct {
             return create_table(table_name, body);
         }
     }
-    fn type_name_as_str(T: type) []const u8 {
+    pub fn type_name_as_str(T: type) []const u8 {
         const t_str = std.fmt.comptimePrint("{}", .{T});
         const table_name = ending_after_last_dot_comptime(t_str);
         return table_name;
     }
 
-    fn create_table(comptime table_name: []const u8, comptime body: []const u8) [:0]const u8 {
+    pub fn create_table(comptime table_name: []const u8, comptime body: []const u8) [:0]const u8 {
         comptime {
             const CREATE_TABLE =
                 \\CREATE TABLE
@@ -56,7 +56,7 @@ const sql = struct {
             return std.fmt.comptimePrint(CREATE_TABLE, .{ table_name, body });
         }
     }
-    fn insert(table_name: []const u8, values: []const u8) [:0]const u8 {
+    pub fn insert(table_name: []const u8, values: []const u8) [:0]const u8 {
         const insert_statement =
             \\INSERT INTO
             \\{s}
@@ -70,7 +70,7 @@ const sql = struct {
     const Action = enum {
         Cascade,
         NoAction,
-        fn stringify(self: *const @This()) []const u8 {
+        pub fn stringify(self: *const @This()) []const u8 {
             const NO_ACTION = "NO ACTION";
             const CASCADE = "CASCADE";
             return switch (self.*) {
@@ -78,11 +78,11 @@ const sql = struct {
                 .NoAction => NO_ACTION,
             };
         }
-        fn on_delete(comptime action: Action) []const u8 {
+        pub fn on_delete(comptime action: Action) []const u8 {
             const FMT_ON_DELETE = "ON DELETE {s}";
             return std.fmt.comptimePrint(FMT_ON_DELETE, .{action.stringify()});
         }
-        fn on_update(comptime action: Action) []const u8 {
+        pub fn on_update(comptime action: Action) []const u8 {
             const FMT_ON_UPDATE = "ON UPDATE {s}";
             return std.fmt.comptimePrint(FMT_ON_UPDATE, .{action.stringify()});
         }
@@ -188,6 +188,7 @@ test "test sqlite3 table from struct" {
 pub const void_ptr: *void = @constCast(&{});
 pub fn no_op(_: *void, _: []const ?[*:0]const u8, _: []const ?[*:0]const u8) !void {}
 pub fn no_op2(_: *void, _: *c.sqlite3_stmt) void {}
+pub fn no_op3(_: *void, _: *PreparedStatement) void {}
 
 fn print_row_result(_: *void, column_name: []const ?[*:0]const u8, column_text: []const ?[*:0]const u8) !void {
     for (column_name, column_text) |col, e| {
@@ -305,8 +306,7 @@ pub fn prepare(hndl: *c.sqlite3, sql_str: []const u8) !*c.sqlite3_stmt {
 
 /// Convenience wrapper for opening a Database Connection, executing statements
 ///
-const Conn = struct {
-    const auto_prefix = "AUTO";
+pub const Conn = struct {
     hndl: *c.sqlite3,
 
     pub fn init(path: ?[:0]const u8) !@This() {
@@ -331,13 +331,25 @@ const Conn = struct {
     }
 };
 
-const PreparedStatement = struct {
+pub const PreparedStatement = struct {
     pstmt: *c.sqlite3_stmt,
     pub fn deinit(self: *@This()) void {
         _ = c.sqlite3_finalize(self.pstmt);
     }
-    pub fn exec(self: *@This(), T: type, cb_ctx: *T, cb: *const fn (*T, *c.sqlite3_stmt) void) !void {
-        try namespace_stmt.step_through(self.pstmt, T, cb_ctx, cb);
+    pub fn exec(self: *@This(), T: type, cb_ctx: *T, cb: *const fn (*T, *PreparedStatement) void) !void {
+        if (c.sqlite3_reset(self.pstmt) != c.SQLITE_OK) return error.Sqlite3ResetFailed;
+        while (true) {
+            const res = c.sqlite3_step(self.pstmt);
+            switch (res) {
+                c.SQLITE_MISUSE => @panic("misuse of sqlite3"),
+                c.SQLITE_DONE => {
+                    if (c.sqlite3_reset(self.pstmt) != c.SQLITE_OK) return error.Sqlite3ResetFailed else return;
+                },
+                c.SQLITE_BUSY => return error.Sqlite3IsBusy,
+                c.SQLITE_ROW => cb(cb_ctx, self),
+                else => return errify(res),
+            }
+        }
     }
     pub fn column_count(self: *@This()) usize {
         return namespace_stmt.column_count(self.pstmt);
@@ -387,16 +399,19 @@ const namespace_stmt = struct {
         return @intCast(count);
     }
 
-    pub fn column_blob_or_utf8_bytes(stmt: *c.sqlite3_stmt, column_index: usize) usize {
+    pub fn blob_or_utf8_byte_count(stmt: *c.sqlite3_stmt, column_index: usize) usize {
         const res = c.sqlite3_column_bytes(stmt, @intCast(column_index));
         const resu: usize = @intCast(res);
         return resu;
     }
 
-    pub fn column_text_u8(stmt: *c.sqlite3_stmt, column_index: usize) [*:0]const u8 {
+    pub fn column_text_u8(stmt: *c.sqlite3_stmt, column_index: usize) []const u8 {
         const res = c.sqlite3_column_text(stmt, @intCast(column_index));
-        const restr: [*:0]const u8 = @ptrCast(res);
-        return restr;
+        var slice: []const u8 = undefined;
+        const p: [*]const u8 = @ptrCast(res);
+        slice.ptr = p;
+        slice.len = blob_or_utf8_byte_count(stmt, column_index);
+        return slice;
     }
 
     pub fn column_f64(stmt: *c.sqlite3_stmt, column_index: usize) f64 {
