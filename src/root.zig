@@ -368,6 +368,21 @@ pub const PreparedStatement = struct {
     pub fn deinit(self: *@This()) void {
         _ = c.sqlite3_finalize(self.pstmt);
     }
+    pub fn spin_till_reset(self: *@This()) void {
+        while (true) {
+            if (errify(c.sqlite3_reset(self.pstmt))) |_| {
+                break;
+            } else |e| {
+                switch (e) {
+                    error.SqliteBusy => continue,
+                    else => {
+                        std.log.err("{}", .{e});
+                        @panic("failed spin reset");
+                    },
+                }
+            }
+        }
+    }
     pub fn exec(self: *@This(), T: type, cb_ctx: *T, cb: *const fn (*T, *PreparedStatement) void) !void {
         const mutex = c.sqlite3_db_mutex(self.hndl).?;
         c.sqlite3_mutex_enter(mutex);
@@ -381,14 +396,17 @@ pub const PreparedStatement = struct {
                     maybe_error = {};
                     break;
                 },
-                c.SQLITE_BUSY => @panic("db was unexpectedly busy"),
+                c.SQLITE_BUSY => {
+                    self.spin_till_reset();
+                    maybe_error = {};
+                },
                 c.SQLITE_ROW => cb(cb_ctx, self),
                 else => {
                     maybe_error = errify(res);
                 },
             }
         }
-        errify(c.sqlite3_reset(self.pstmt)) catch @panic("failed pstmt reset");
+        self.spin_till_reset();
         errify(c.sqlite3_clear_bindings(self.pstmt)) catch @panic("failed to clear bindings");
         c.sqlite3_mutex_leave(mutex);
         try maybe_error;
