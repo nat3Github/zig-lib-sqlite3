@@ -197,14 +197,44 @@ fn print_row_result(_: *void, column_name: []const ?[*:0]const u8, column_text: 
         std.log.warn("column {s}: {s}", .{ name_str, content });
     }
 }
-pub fn errify(err: c_int) !void {
+pub fn errify(err: c_int) SqliteErrorSet!void {
     errify2(err) catch |e| {
         std.log.err("{}", .{e});
         return e;
     };
 }
+pub const SqliteErrorSet = error{
+    SqliteAbort,
+    SqliteAuth,
+    SqliteBusy,
+    SqliteCantopen,
+    SqliteConstraint,
+    SqliteCorrupt,
+    SqliteEmpty,
+    SqliteError,
+    SqliteFormat,
+    SqliteFull,
+    SqliteInternal,
+    SqliteInterrupt,
+    SqliteIoerr,
+    SqliteLocked,
+    SqliteMismatch,
+    SqliteMisuse,
+    SqliteNolfs,
+    SqliteNomem,
+    SqliteNotaDB,
+    SqliteNotfound,
+    SqliteNotice,
+    SqlitePerm,
+    SqliteProtocol,
+    SqliteRange,
+    SqliteReadonly,
+    SqliteSchema,
+    SqliteToobig,
+    SqliteWarning,
+};
 
-pub fn errify2(err: c_int) !void {
+pub fn errify2(err: c_int) SqliteErrorSet!void {
     return switch (err) {
         101 => {}, //sqlite done
         0 => {}, //sqlite ok
@@ -327,29 +357,41 @@ pub const Conn = struct {
         const ps = try prepare(self.hndl, sql_str);
         return PreparedStatement{
             .pstmt = ps,
+            .hndl = self.hndl,
         };
     }
 };
 
 pub const PreparedStatement = struct {
     pstmt: *c.sqlite3_stmt,
+    hndl: *c.sqlite3,
     pub fn deinit(self: *@This()) void {
         _ = c.sqlite3_finalize(self.pstmt);
     }
     pub fn exec(self: *@This(), T: type, cb_ctx: *T, cb: *const fn (*T, *PreparedStatement) void) !void {
-        if (c.sqlite3_reset(self.pstmt) != c.SQLITE_OK) return error.Sqlite3ResetFailed;
+        const mutex = c.sqlite3_db_mutex(self.hndl).?;
+        c.sqlite3_mutex_enter(mutex);
+
+        var maybe_error: SqliteErrorSet!void = {};
         while (true) {
             const res = c.sqlite3_step(self.pstmt);
             switch (res) {
                 c.SQLITE_MISUSE => @panic("misuse of sqlite3"),
                 c.SQLITE_DONE => {
-                    if (c.sqlite3_reset(self.pstmt) != c.SQLITE_OK) return error.Sqlite3ResetFailed else return;
+                    maybe_error = {};
+                    break;
                 },
-                c.SQLITE_BUSY => return error.Sqlite3IsBusy,
+                c.SQLITE_BUSY => @panic("db was unexpectedly busy"),
                 c.SQLITE_ROW => cb(cb_ctx, self),
-                else => return errify(res),
+                else => {
+                    maybe_error = errify(res);
+                },
             }
         }
+        errify(c.sqlite3_reset(self.pstmt)) catch @panic("failed pstmt reset");
+        errify(c.sqlite3_clear_bindings(self.pstmt)) catch @panic("failed to clear bindings");
+        c.sqlite3_mutex_leave(mutex);
+        try maybe_error;
     }
     pub fn column_count(self: *@This()) usize {
         return namespace_stmt.column_count(self.pstmt);
