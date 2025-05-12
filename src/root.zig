@@ -10,6 +10,16 @@ const Allocator = std.mem.Allocator;
 const Type = std.builtin.Type;
 
 pub const sql = struct {
+    pub fn list_of_question_marks(comptime count: usize) []const u8 {
+        comptime {
+            if (count == 0) return "";
+            var s: []const u8 = "?";
+            for (1..count) |_| {
+                s = s ++ ", ?";
+            }
+            return s;
+        }
+    }
     pub fn comptime_join(comptime list: []const []const u8, sep: []const u8) []const u8 {
         comptime {
             var s: []const u8 = "";
@@ -532,3 +542,66 @@ const namespace_stmt = struct {
         try errify(res);
     }
 };
+
+/// this helps with retrieving data from statements that produce rows.
+/// statements take a ctx + callback fn to process row results from queries!
+/// collect fn will fill all its fields
+/// handles f32, f64, i32, u32, i64, u64 and []const u8
+/// alloc is used for duping []const u8s
+///
+///```zig
+///    const Usize = struct {
+///        num: usize,
+///    };
+///    const CountResult = CollectOne(Usize);
+///    var count_of = CountResult{ .alloc = undefined };
+///    try my_statement_that_retrieves_some_count.exec(CountResult, &count_of, UsizeCountOf.collect);
+///    return count_of.inner().num;
+///```
+pub fn CollectOne(T: type) type {
+    return struct {
+        const fields = @typeInfo(T).@"struct".fields;
+        inner: ?T = null,
+        e: ?anyerror = null,
+        alloc: Allocator, // can be set to undefined if not needed
+        pub fn collect(this: *@This(), s: *PreparedStatement) void {
+            assert(s.column_count() == fields.len);
+            var w: T = undefined;
+            inline for (fields, 0..) |f, i| {
+                const x = &@field(w, f.name);
+                const r: f.type = switch (f.type) {
+                    f32, f64 => @floatCast(s.column_f64(i)),
+                    i32, u32, i64, u64, usize => @intCast(s.column_i64(i)),
+                    []const u8 => blk: {
+                        const blob = s.column_text_u8(i);
+                        const duped_blob = this.alloc.dupe(u8, blob) catch |e| {
+                            this.e = e;
+                            return;
+                        };
+                        break :blk duped_blob;
+                    },
+                    else => @compileError("not implemented"),
+                };
+                x.* = r;
+            }
+            this.inner = w;
+        }
+        pub fn result(self: *@This()) !?T {
+            if (self.e) |e| {
+                return e;
+            } else return self.inner;
+        }
+        pub fn deinit(self: *@This()) void {
+            inline for (fields) |f| {
+                switch (f.type) {
+                    []const u8 => {
+                        if (self.inner) |inner| {
+                            self.alloc.free(@field(inner, f.name));
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    };
+}
