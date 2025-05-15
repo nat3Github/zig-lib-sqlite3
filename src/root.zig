@@ -209,7 +209,7 @@ fn print_row_result(_: *void, column_name: []const ?[*:0]const u8, column_text: 
 }
 pub fn errify(err: c_int) SqliteErrorSet!void {
     errify2(err) catch |e| {
-        std.log.err("{}", .{e});
+        std.log.warn("{}", .{e});
         return e;
     };
 }
