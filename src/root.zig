@@ -1032,7 +1032,7 @@ pub const StmtCache = struct {
 // Query operators
 // ============================================================================
 
-pub const OpKind = enum { scalar, is_null, is_not_null, in_op, between_op };
+pub const OpKind = enum { scalar, is_null, is_not_null, in_op, not_in_op, between_op, not_between_op };
 
 /// SQL operator markers. Use as `op.gte(18)`, `op.like("a%")`,
 /// `op.in(.{1,2,3})`, `op.between(10, 20)`, `op.isNull`, `op.notNull`.
@@ -1098,6 +1098,32 @@ pub const op = struct {
     }
     pub fn between(lo: anytype, hi: anytype) BetweenT(@TypeOf(lo)) {
         return .{ .lo = lo, .hi = hi };
+    }
+
+    pub fn glob(v: []const u8) Scalar("GLOB", []const u8) {
+        return .{ .v = v };
+    }
+    pub fn notLike(v: []const u8) Scalar("NOT LIKE", []const u8) {
+        return .{ .v = v };
+    }
+    pub fn notIn(values: anytype) NotIn(@TypeOf(values)) {
+        return .{ .v = values };
+    }
+    fn NotIn(comptime ValuesT: type) type {
+        return struct {
+            v: ValuesT,
+            pub const sql_op_kind: OpKind = .not_in_op;
+        };
+    }
+    pub fn notBetween(lo: anytype, hi: anytype) NotBetweenT(@TypeOf(lo)) {
+        return .{ .lo = lo, .hi = hi };
+    }
+    fn NotBetweenT(comptime T: type) type {
+        return struct {
+            lo: T,
+            hi: T,
+            pub const sql_op_kind: OpKind = .not_between_op;
+        };
     }
 };
 
@@ -1278,10 +1304,11 @@ fn opFragment(comptime FT: type, comptime field_name: []const u8) []const u8 {
             .scalar => return field_name ++ " " ++ FT.sql_op_str ++ " ?",
             .is_null => return field_name ++ " IS NULL",
             .is_not_null => return field_name ++ " IS NOT NULL",
-            .in_op => {
+            .in_op, .not_in_op => {
                 const n = inValueCount(FT);
-                if (n == 0) @compileError("op.in: empty value list");
-                var s: []const u8 = field_name ++ " IN (";
+                if (n == 0) @compileError("op.in/notIn: empty value list");
+                const kw: []const u8 = if (FT.sql_op_kind == .not_in_op) " NOT IN (" else " IN (";
+                var s: []const u8 = field_name ++ kw;
                 for (0..n) |i| {
                     if (i > 0) s = s ++ ", ";
                     s = s ++ "?";
@@ -1289,6 +1316,7 @@ fn opFragment(comptime FT: type, comptime field_name: []const u8) []const u8 {
                 return s ++ ")";
             },
             .between_op => return field_name ++ " BETWEEN ? AND ?",
+            .not_between_op => return field_name ++ " NOT BETWEEN ? AND ?",
         }
     }
 }
@@ -1298,8 +1326,8 @@ fn opPlaceholders(comptime FT: type) usize {
     return switch (FT.sql_op_kind) {
         .scalar => 1,
         .is_null, .is_not_null => 0,
-        .in_op => inValueCount(FT),
-        .between_op => 2,
+        .in_op, .not_in_op => inValueCount(FT),
+        .between_op, .not_between_op => 2,
     };
 }
 
@@ -1315,7 +1343,7 @@ fn bindOp(stmt: *Stmt, idx: c_int, comptime FT: type, value: anytype) Error!c_in
             return idx + 1;
         },
         .is_null, .is_not_null => return idx,
-        .in_op => {
+        .in_op, .not_in_op => {
             var cur = idx;
             const vs = value.v;
             inline for (@typeInfo(@TypeOf(vs)).@"struct".fields) |vf| {
@@ -1324,7 +1352,7 @@ fn bindOp(stmt: *Stmt, idx: c_int, comptime FT: type, value: anytype) Error!c_in
             }
             return cur;
         },
-        .between_op => {
+        .between_op, .not_between_op => {
             try stmt.bindAny(idx, value.lo, null);
             try stmt.bindAny(idx + 1, value.hi, null);
             return idx + 2;
@@ -1654,6 +1682,88 @@ pub fn Repo(comptime T: type) type {
             return try r.find(fk_value);
         }
 
+        /// Bulk insert N rows of a homogeneous value struct in a single
+        /// transaction with one prepared statement. ~10-100x faster than
+        /// looping `insert`. Does not return inserted rows (use individual
+        /// `insert` if you need PK populated per row).
+        pub fn insertMany(self: Self, comptime V: type, values: []const V) Error!void {
+            if (values.len == 0) return;
+            const v_fields = @typeInfo(V).@"struct".fields;
+
+            comptime var cols: []const u8 = "";
+            comptime var qs: []const u8 = "";
+            comptime {
+                var first = true;
+                for (v_fields) |f| {
+                    if (!first) {
+                        cols = cols ++ ", ";
+                        qs = qs ++ ", ";
+                    }
+                    first = false;
+                    cols = cols ++ f.name;
+                    qs = qs ++ "?";
+                }
+                if (ts_created) |ts_c| {
+                    if (!first) {
+                        cols = cols ++ ", ";
+                        qs = qs ++ ", ";
+                    }
+                    first = false;
+                    cols = cols ++ ts_c;
+                    qs = qs ++ "?";
+                }
+                if (ts_updated) |ts_u| {
+                    if (!first) {
+                        cols = cols ++ ", ";
+                        qs = qs ++ ", ";
+                    }
+                    cols = cols ++ ts_u;
+                    qs = qs ++ "?";
+                }
+            }
+            const sql_str = "INSERT INTO " ++ table ++ "(" ++ cols ++ ") VALUES(" ++ qs ++ ");";
+            const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
+
+            var tx = try self.conn.begin();
+            errdefer tx.rollback();
+            var stmt = try self.conn.prepare(sql_text, null);
+            defer stmt.deinit();
+
+            const now: i64 = std.time.timestamp();
+            for (values) |val| {
+                try stmt.reset();
+                stmt.clearBindings();
+                var idx: c_int = 1;
+                inline for (v_fields) |f| {
+                    try stmt.bindAny(idx, @field(val, f.name), null);
+                    idx += 1;
+                }
+                if (ts_created != null) {
+                    try stmt.bindAny(idx, now, null);
+                    idx += 1;
+                }
+                if (ts_updated != null) {
+                    try stmt.bindAny(idx, now, null);
+                    idx += 1;
+                }
+                try stmt.execDone(null);
+            }
+            try tx.commit();
+        }
+
+        /// Return existing row matching `field == lookup_value`, else insert
+        /// `defaults` (which must include lookup_value).
+        pub fn findOrCreate(
+            self: Self,
+            comptime field: std.meta.FieldEnum(T),
+            lookup_value: anytype,
+            defaults: anytype,
+        ) Error!T {
+            if (try self.findBy(field, lookup_value)) |existing| return existing;
+            return try self.insert(defaults);
+        }
+
+
         /// Batched eager-load: returns map keyed by parent PK → owned slice of children.
         /// Issues one `WHERE fk IN (...)` query, groups in-memory.
         /// Caller frees each value slice with the corresponding child repo's `freeAll`
@@ -1893,6 +2003,12 @@ fn Where(comptime T: type, comptime Conds: type) type {
             var copy = self;
             copy.offset_n = n;
             return copy;
+        }
+
+        /// 1-indexed pagination. `page = 1` is first page.
+        pub fn paginate(self: Self, page: i64, per_page: i64) Self {
+            const off: i64 = if (page > 1) (page - 1) * per_page else 0;
+            return self.limit(per_page).offset(off);
         }
 
         /// Execute and collect all rows.
@@ -2548,6 +2664,96 @@ test "loadChildrenBatched: one query for N parents" {
     }
     try testing.expectEqual(@as(usize, 3), map.get(a1.id.?).?.len);
     try testing.expectEqual(@as(usize, 1), map.get(a2.id.?).?.len);
+}
+
+test "insertMany: bulk insert" {
+    const alloc = testing.allocator;
+    var db = try Conn.open(.{ .path = null, .app_defaults = false });
+    defer db.close();
+    const repo = Repo(Person).init(&db, alloc);
+    try repo.createTable();
+    const Values = struct { name: []const u8, age: ?u32 };
+    const rows = [_]Values{
+        .{ .name = "a", .age = 1 },
+        .{ .name = "b", .age = 2 },
+        .{ .name = "c", .age = 3 },
+    };
+    try repo.insertMany(Values, &rows);
+    try testing.expectEqual(@as(i64, 3), try repo.count());
+}
+
+test "findOrCreate" {
+    const alloc = testing.allocator;
+    var db = try Conn.open(.{ .path = null, .app_defaults = false });
+    defer db.close();
+    const repo = Repo(Person).init(&db, alloc);
+    try repo.createTable();
+    const a = try repo.findOrCreate(.name, "alice", .{ .name = @as([]const u8, "alice"), .age = @as(?u32, 30) });
+    defer freeRow(Person, alloc, a);
+    const a2 = try repo.findOrCreate(.name, "alice", .{ .name = @as([]const u8, "alice"), .age = @as(?u32, 99) });
+    defer freeRow(Person, alloc, a2);
+    try testing.expectEqual(a.id, a2.id);
+    try testing.expectEqual(@as(i64, 1), try repo.count());
+}
+
+test "paginate" {
+    const alloc = testing.allocator;
+    var db = try Conn.open(.{ .path = null, .app_defaults = false });
+    defer db.close();
+    const repo = Repo(Person).init(&db, alloc);
+    try repo.createTable();
+    const Values = struct { name: []const u8, age: ?u32 };
+    var rows: [10]Values = undefined;
+    var name_buf: [10][1]u8 = undefined;
+    for (&rows, 0..) |*r, i| {
+        name_buf[i] = .{@as(u8, @intCast('a' + i))};
+        r.* = .{ .name = &name_buf[i], .age = @as(u32, @intCast(i)) };
+    }
+    try repo.insertMany(Values, &rows);
+
+    const page1 = try repo.query().where(.{}).orderBy(.age, .asc).paginate(1, 3).all();
+    defer repo.freeAll(page1);
+    try testing.expectEqual(@as(usize, 3), page1.len);
+    try testing.expectEqual(@as(?u32, 0), page1[0].age);
+
+    const page2 = try repo.query().where(.{}).orderBy(.age, .asc).paginate(2, 3).all();
+    defer repo.freeAll(page2);
+    try testing.expectEqual(@as(?u32, 3), page2[0].age);
+}
+
+test "ops: notIn + notBetween + glob" {
+    const alloc = testing.allocator;
+    var db = try Conn.open(.{ .path = null, .app_defaults = false });
+    defer db.close();
+    const repo = Repo(Person).init(&db, alloc);
+    try repo.createTable();
+    const Values = struct { name: []const u8, age: ?u32 };
+    const rows = [_]Values{
+        .{ .name = "alpha", .age = 5 },
+        .{ .name = "beta", .age = 15 },
+        .{ .name = "gamma", .age = 25 },
+        .{ .name = "delta", .age = 35 },
+    };
+    try repo.insertMany(Values, &rows);
+
+    const not_in = try repo.query()
+        .where(.{ .age = op.notIn(.{ @as(u32, 5), @as(u32, 35) }) })
+        .all();
+    defer repo.freeAll(not_in);
+    try testing.expectEqual(@as(usize, 2), not_in.len);
+
+    const not_between = try repo.query()
+        .where(.{ .age = op.notBetween(@as(u32, 10), @as(u32, 30)) })
+        .all();
+    defer repo.freeAll(not_between);
+    try testing.expectEqual(@as(usize, 2), not_between.len);
+
+    const glob_match = try repo.query()
+        .where(.{ .name = op.glob("a*") })
+        .all();
+    defer repo.freeAll(glob_match);
+    try testing.expectEqual(@as(usize, 1), glob_match.len);
+    try testing.expectEqualStrings("alpha", glob_match[0].name);
 }
 
 test "Pool: acquire + release" {

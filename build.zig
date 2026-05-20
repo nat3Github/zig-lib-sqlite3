@@ -5,6 +5,7 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run the example application");
     const test_step = b.step("test", "Test the library");
+    const bench_step = b.step("bench", "Run benchmarks");
 
     const sqlite3_module = b.addModule("sqlite3", .{
         .target = target,
@@ -33,4 +34,17 @@ pub fn build(b: *std.Build) void {
 
     const run_exe = b.addRunArtifact(exe);
     run_step.dependOn(&run_exe.step);
+
+    const bench_module = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_module.addImport("sqlite3", sqlite3_module);
+    const bench_exe = b.addExecutable(.{
+        .name = "sqlite-bench",
+        .root_module = bench_module,
+    });
+    const run_bench = b.addRunArtifact(bench_exe);
+    bench_step.dependOn(&run_bench.step);
 }

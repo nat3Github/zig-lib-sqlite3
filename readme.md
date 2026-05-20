@@ -9,6 +9,7 @@ Targets **zig 0.14.0**.
 ```
 zig build test     # run library tests
 zig build run      # run example
+zig build bench    # microbenchmarks (ReleaseFast)
 ```
 
 ## Use as dependency
@@ -126,11 +127,16 @@ defer repo.freeAll(adults);
 ```
 
 **Operators** (`sql.op`): `eq`, `neq`, `lt`, `lte`, `gt`, `gte`, `like`,
-`isNull`, `notNull`, `in(.{...})`, `between(lo, hi)`. Bare values in
-`.where(.{...})` mean equality.
+`notLike`, `glob`, `isNull`, `notNull`, `in(.{...})`, `notIn(.{...})`,
+`between(lo, hi)`, `notBetween(lo, hi)`. Bare values in `.where(.{...})`
+mean equality.
 
 **Query builder methods**: `.where(...)`, `.orderBy(.field, .asc/.desc)`,
-`.limit(n)`, `.offset(n)`, `.all()`, `.first()`, `.count()`, `.delete()`.
+`.limit(n)`, `.offset(n)`, `.paginate(page, per_page)`, `.all()`,
+`.first()`, `.count()`, `.delete()`.
+
+**Repo bulk + convenience**: `.insertMany(V, slice)` (single txn, prepared
+once), `.findOrCreate(.field, lookup, defaults)`.
 
 ### Timestamps + soft delete
 
