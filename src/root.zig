@@ -142,6 +142,7 @@ pub const OpenOptions = struct {
 pub const Conn = struct {
     db: *c.sqlite3,
     cache: ?*StmtCache = null,
+    tx_depth: u32 = 0,
 
     pub fn open(opts: OpenOptions) Error!Conn {
         var raw: ?*c.sqlite3 = null;
@@ -286,28 +287,58 @@ pub const Conn = struct {
 
     pub const Tx = struct {
         conn: *Conn,
+        depth: u32,
         finished: bool = false,
 
         pub fn commit(self: *Tx) Error!void {
             if (self.finished) return;
             self.finished = true;
-            try self.conn.execNoArgs("COMMIT;", null);
+            if (self.depth == 1) {
+                try self.conn.execNoArgs("COMMIT;", null);
+            } else {
+                var buf: [64]u8 = undefined;
+                const s = std.fmt.bufPrintZ(&buf, "RELEASE sp{d};", .{self.depth}) catch unreachable;
+                try self.conn.execNoArgs(s, null);
+            }
+            self.conn.tx_depth -|= 1;
         }
         pub fn rollback(self: *Tx) void {
             if (self.finished) return;
             self.finished = true;
-            self.conn.execNoArgs("ROLLBACK;", null) catch {};
+            if (self.depth == 1) {
+                self.conn.execNoArgs("ROLLBACK;", null) catch {};
+            } else {
+                var buf: [64]u8 = undefined;
+                const s1 = std.fmt.bufPrintZ(&buf, "ROLLBACK TO sp{d};", .{self.depth}) catch unreachable;
+                self.conn.execNoArgs(s1, null) catch {};
+                var buf2: [64]u8 = undefined;
+                const s2 = std.fmt.bufPrintZ(&buf2, "RELEASE sp{d};", .{self.depth}) catch unreachable;
+                self.conn.execNoArgs(s2, null) catch {};
+            }
+            self.conn.tx_depth -|= 1;
         }
     };
 
+    /// Begin transaction. Nested calls create SAVEPOINTs. Each Tx must be
+    /// committed or rolled back; mismatched nesting is your bug.
     pub fn begin(self: *Conn) Error!Tx {
-        try self.execNoArgs("BEGIN;", null);
-        return Tx{ .conn = self };
+        const new_depth = self.tx_depth + 1;
+        if (new_depth == 1) {
+            try self.execNoArgs("BEGIN;", null);
+        } else {
+            var buf: [64]u8 = undefined;
+            const s = std.fmt.bufPrintZ(&buf, "SAVEPOINT sp{d};", .{new_depth}) catch unreachable;
+            try self.execNoArgs(s, null);
+        }
+        self.tx_depth = new_depth;
+        return Tx{ .conn = self, .depth = new_depth };
     }
 
     pub fn beginImmediate(self: *Conn) Error!Tx {
+        if (self.tx_depth > 0) return self.begin(); // nested: SAVEPOINT only
         try self.execNoArgs("BEGIN IMMEDIATE;", null);
-        return Tx{ .conn = self };
+        self.tx_depth = 1;
+        return Tx{ .conn = self, .depth = 1 };
     }
 
     // ---- migrations -----------------------------------------------------
@@ -1384,6 +1415,7 @@ pub fn Repo(comptime T: type) type {
     return struct {
         conn: *Conn,
         alloc: Allocator,
+        diag: ?*Diag = null,
 
         const Self = @This();
         const table = entityTable(T);
@@ -1396,6 +1428,41 @@ pub fn Repo(comptime T: type) type {
 
         pub fn init(conn: *Conn, alloc: Allocator) Self {
             return .{ .conn = conn, .alloc = alloc };
+        }
+
+        /// Returns a copy of this Repo wired to capture sqlite error info into `d`.
+        pub fn withDiag(self: Self, d: *Diag) Self {
+            var copy = self;
+            copy.diag = d;
+            return copy;
+        }
+
+        const StmtLease = struct {
+            stmt_storage: Stmt = undefined,
+            cached_ptr: ?*Stmt = null,
+
+            pub fn ptr(self: *StmtLease) *Stmt {
+                return self.cached_ptr orelse &self.stmt_storage;
+            }
+            pub fn deinit(self: *StmtLease) void {
+                if (self.cached_ptr == null) self.stmt_storage.deinit();
+            }
+        };
+
+        /// Cache-aware statement acquisition. If `conn.cache` is set, returns
+        /// the cached `*Stmt` (reset + cleared). Otherwise prepares fresh into
+        /// `lease.stmt_storage`. Caller `defer lease.deinit()`.
+        fn lease(self: Self, comptime sql_text: [:0]const u8) Error!StmtLease {
+            var l: StmtLease = .{};
+            if (self.conn.cache) |cache| {
+                const s = try cache.getOrPrepare(sql_text);
+                try s.reset();
+                s.clearBindings();
+                l.cached_ptr = s;
+            } else {
+                l.stmt_storage = try self.conn.prepare(sql_text, self.diag);
+            }
+            return l;
         }
 
         /// Insert. `values` is an anon struct with a subset of T's fields.
@@ -1439,23 +1506,24 @@ pub fn Repo(comptime T: type) type {
             const sql_str = "INSERT INTO " ++ table ++ "(" ++ cols ++ ") VALUES(" ++ qs ++ ");";
             const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
 
-            var stmt = try self.conn.prepare(sql_text, null);
-            defer stmt.deinit();
+            var l = try self.lease(sql_text);
+            defer l.deinit();
+            const stmt = l.ptr();
             var idx: c_int = 1;
             inline for (v_fields) |f| {
-                try stmt.bindAny(idx, @field(values, f.name), null);
+                try stmt.bindAny(idx, @field(values, f.name), self.diag);
                 idx += 1;
             }
             const now: i64 = std.time.timestamp();
             if (ts_created != null) {
-                try stmt.bindAny(idx, now, null);
+                try stmt.bindAny(idx, now, self.diag);
                 idx += 1;
             }
             if (ts_updated != null) {
-                try stmt.bindAny(idx, now, null);
+                try stmt.bindAny(idx, now, self.diag);
                 idx += 1;
             }
-            try stmt.execDone(null);
+            try stmt.execDone(self.diag);
 
             const rowid = self.conn.lastInsertRowid();
             return (try self.findRowid(rowid)) orelse error.SqliteError;
@@ -1467,26 +1535,28 @@ pub fn Repo(comptime T: type) type {
             const cond = comptime aliveFilter(T);
             const sql_str = "SELECT " ++ all_cols ++ " FROM " ++ table ++ " WHERE " ++ pk_where ++ " AND " ++ cond ++ ";";
             const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
-            var stmt = try self.conn.prepare(sql_text, null);
-            defer stmt.deinit();
-            _ = try bindPk(&stmt, 1, pk_value);
-            return try stepOne(T, &stmt, self.alloc);
+            var l = try self.lease(sql_text);
+            defer l.deinit();
+            const stmt = l.ptr();
+            _ = try bindPk(stmt, 1, pk_value);
+            return try stepOne(T, stmt, self.alloc);
         }
 
         /// Find a row including soft-deleted entries.
         pub fn findIncludingDeleted(self: Self, pk_value: anytype) Error!?T {
             const sql_str = "SELECT " ++ all_cols ++ " FROM " ++ table ++ " WHERE " ++ pk_where ++ ";";
             const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
-            var stmt = try self.conn.prepare(sql_text, null);
-            defer stmt.deinit();
-            _ = try bindPk(&stmt, 1, pk_value);
-            return try stepOne(T, &stmt, self.alloc);
+            var l = try self.lease(sql_text);
+            defer l.deinit();
+            const stmt = l.ptr();
+            _ = try bindPk(stmt, 1, pk_value);
+            return try stepOne(T, stmt, self.alloc);
         }
 
         fn findRowid(self: Self, rowid: i64) Error!?T {
             const sql_str = "SELECT " ++ all_cols ++ " FROM " ++ table ++ " WHERE rowid = ?;";
             const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
-            return try self.conn.queryOne(T, sql_text, .{rowid}, self.alloc, null);
+            return try self.conn.queryOne(T, sql_text, .{rowid}, self.alloc, self.diag);
         }
 
         /// Find first row matching exact field equality. Honors soft-delete.
@@ -1495,7 +1565,7 @@ pub fn Repo(comptime T: type) type {
             const cond = comptime aliveFilter(T);
             const sql_str = "SELECT " ++ all_cols ++ " FROM " ++ table ++ " WHERE " ++ fname ++ " = ? AND " ++ cond ++ ";";
             const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
-            return try self.conn.queryOne(T, sql_text, .{value}, self.alloc, null);
+            return try self.conn.queryOne(T, sql_text, .{value}, self.alloc, self.diag);
         }
 
         /// Fetch all rows. Caller owns slice + slice fields; use `freeAll`.
@@ -1503,7 +1573,7 @@ pub fn Repo(comptime T: type) type {
             const cond = comptime aliveFilter(T);
             const sql_str = "SELECT " ++ all_cols ++ " FROM " ++ table ++ " WHERE " ++ cond ++ ";";
             const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
-            return try collectAll(T, self.conn, sql_text, .{}, self.alloc);
+            return try collectAll(T, self.conn, sql_text, .{}, self.alloc, self.diag);
         }
 
         pub fn count(self: Self) Error!i64 {
@@ -1511,7 +1581,7 @@ pub fn Repo(comptime T: type) type {
             const sql_str = "SELECT COUNT(*) FROM " ++ table ++ " WHERE " ++ cond ++ ";";
             const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
             const Row = struct { c: i64 };
-            const r = try self.conn.queryOne(Row, sql_text, .{}, self.alloc, null);
+            const r = try self.conn.queryOne(Row, sql_text, .{}, self.alloc, self.diag);
             return if (r) |row| row.c else 0;
         }
 
@@ -1537,19 +1607,20 @@ pub fn Repo(comptime T: type) type {
             const sql_str = "UPDATE " ++ table ++ " SET " ++ sets ++ " WHERE " ++ pk_where ++ ";";
             const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
 
-            var stmt = try self.conn.prepare(sql_text, null);
-            defer stmt.deinit();
+            var l = try self.lease(sql_text);
+            defer l.deinit();
+            const stmt = l.ptr();
             var idx: c_int = 1;
             inline for (c_fields) |f| {
-                try stmt.bindAny(idx, @field(changes, f.name), null);
+                try stmt.bindAny(idx, @field(changes, f.name), self.diag);
                 idx += 1;
             }
             if (ts_updated != null) {
-                try stmt.bindAny(idx, @as(i64, std.time.timestamp()), null);
+                try stmt.bindAny(idx, @as(i64, std.time.timestamp()), self.diag);
                 idx += 1;
             }
-            _ = try bindPk(&stmt, idx, pk_value);
-            try stmt.execDone(null);
+            _ = try bindPk(stmt, idx, pk_value);
+            try stmt.execDone(self.diag);
         }
 
         /// Delete by PK. When `soft_delete` configured, sets the field to now()
@@ -1558,18 +1629,20 @@ pub fn Repo(comptime T: type) type {
             if (comptime soft_field) |f| {
                 const sql_str = "UPDATE " ++ table ++ " SET " ++ f ++ " = ? WHERE " ++ pk_where ++ ";";
                 const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
-                var stmt = try self.conn.prepare(sql_text, null);
-                defer stmt.deinit();
-                try stmt.bindAny(1, @as(i64, std.time.timestamp()), null);
-                _ = try bindPk(&stmt, 2, pk_value);
-                try stmt.execDone(null);
+                var l = try self.lease(sql_text);
+                defer l.deinit();
+                const stmt = l.ptr();
+                try stmt.bindAny(1, @as(i64, std.time.timestamp()), self.diag);
+                _ = try bindPk(stmt, 2, pk_value);
+                try stmt.execDone(self.diag);
             } else {
                 const sql_str = "DELETE FROM " ++ table ++ " WHERE " ++ pk_where ++ ";";
                 const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
-                var stmt = try self.conn.prepare(sql_text, null);
-                defer stmt.deinit();
-                _ = try bindPk(&stmt, 1, pk_value);
-                try stmt.execDone(null);
+                var l = try self.lease(sql_text);
+                defer l.deinit();
+                const stmt = l.ptr();
+                _ = try bindPk(stmt, 1, pk_value);
+                try stmt.execDone(self.diag);
             }
         }
 
@@ -1577,10 +1650,11 @@ pub fn Repo(comptime T: type) type {
         pub fn deleteHard(self: Self, pk_value: anytype) Error!void {
             const sql_str = "DELETE FROM " ++ table ++ " WHERE " ++ pk_where ++ ";";
             const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
-            var stmt = try self.conn.prepare(sql_text, null);
-            defer stmt.deinit();
-            _ = try bindPk(&stmt, 1, pk_value);
-            try stmt.execDone(null);
+            var l = try self.lease(sql_text);
+            defer l.deinit();
+            const stmt = l.ptr();
+            _ = try bindPk(stmt, 1, pk_value);
+            try stmt.execDone(self.diag);
         }
 
         /// Clear the soft-delete marker. Compile-time error if soft-delete not configured.
@@ -1588,10 +1662,11 @@ pub fn Repo(comptime T: type) type {
             const f = comptime soft_field orelse @compileError(@typeName(T) ++ ": restore requires .soft_delete config");
             const sql_str = "UPDATE " ++ table ++ " SET " ++ f ++ " = NULL WHERE " ++ pk_where ++ ";";
             const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
-            var stmt = try self.conn.prepare(sql_text, null);
-            defer stmt.deinit();
-            _ = try bindPk(&stmt, 1, pk_value);
-            try stmt.execDone(null);
+            var l = try self.lease(sql_text);
+            defer l.deinit();
+            const stmt = l.ptr();
+            _ = try bindPk(stmt, 1, pk_value);
+            try stmt.execDone(self.diag);
         }
 
         /// Insert OR update on PK conflict. Returns row with PK set.
@@ -1644,18 +1719,19 @@ pub fn Repo(comptime T: type) type {
                 "INSERT INTO " ++ table ++ "(" ++ cols ++ ") VALUES(" ++ qs ++ ") ON CONFLICT(" ++ conflict_target ++ ") DO UPDATE SET " ++ set_clause ++ ";";
             const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
 
-            var stmt = try self.conn.prepare(sql_text, null);
-            defer stmt.deinit();
+            var l = try self.lease(sql_text);
+            defer l.deinit();
+            const stmt = l.ptr();
             var idx: c_int = 1;
             inline for (v_fields) |f| {
-                try stmt.bindAny(idx, @field(values, f.name), null);
+                try stmt.bindAny(idx, @field(values, f.name), self.diag);
                 idx += 1;
             }
             if (ts_updated != null and comptime set_clause.len > 0) {
-                try stmt.bindAny(idx, @as(i64, std.time.timestamp()), null);
+                try stmt.bindAny(idx, @as(i64, std.time.timestamp()), self.diag);
                 idx += 1;
             }
-            try stmt.execDone(null);
+            try stmt.execDone(self.diag);
 
             const rowid = self.conn.lastInsertRowid();
             return (try self.findRowid(rowid)) orelse error.SqliteError;
@@ -1672,7 +1748,7 @@ pub fn Repo(comptime T: type) type {
             const cond = comptime aliveFilter(ChildT);
             const sql_str = comptime "SELECT " ++ child_cols ++ " FROM " ++ child_table ++ " WHERE " ++ fk_field ++ " = ? AND " ++ cond ++ ";";
             const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
-            return try collectAll(ChildT, self.conn, sql_text, .{parent_pk_value}, self.alloc);
+            return try collectAll(ChildT, self.conn, sql_text, .{parent_pk_value}, self.alloc, self.diag);
         }
 
         /// Look up the parent referenced by `fk_value` (typically `child.fk_field`).
@@ -1726,8 +1802,9 @@ pub fn Repo(comptime T: type) type {
 
             var tx = try self.conn.begin();
             errdefer tx.rollback();
-            var stmt = try self.conn.prepare(sql_text, null);
-            defer stmt.deinit();
+            var l = try self.lease(sql_text);
+            defer l.deinit();
+            const stmt = l.ptr();
 
             const now: i64 = std.time.timestamp();
             for (values) |val| {
@@ -1735,18 +1812,18 @@ pub fn Repo(comptime T: type) type {
                 stmt.clearBindings();
                 var idx: c_int = 1;
                 inline for (v_fields) |f| {
-                    try stmt.bindAny(idx, @field(val, f.name), null);
+                    try stmt.bindAny(idx, @field(val, f.name), self.diag);
                     idx += 1;
                 }
                 if (ts_created != null) {
-                    try stmt.bindAny(idx, now, null);
+                    try stmt.bindAny(idx, now, self.diag);
                     idx += 1;
                 }
                 if (ts_updated != null) {
-                    try stmt.bindAny(idx, now, null);
+                    try stmt.bindAny(idx, now, self.diag);
                     idx += 1;
                 }
-                try stmt.execDone(null);
+                try stmt.execDone(self.diag);
             }
             try tx.commit();
         }
@@ -1796,12 +1873,14 @@ pub fn Repo(comptime T: type) type {
             sql_buf.append(self.alloc, 0) catch return error.OutOfMemory;
             const sql_text = sql_buf.items[0 .. sql_buf.items.len - 1 :0];
 
-            var stmt = try self.conn.prepare(sql_text, null);
-            defer stmt.deinit();
+            // Runtime-length SQL cannot benefit from cache; prepare directly.
+            var stmt_storage = try self.conn.prepare(sql_text, self.diag);
+            defer stmt_storage.deinit();
+            const stmt = &stmt_storage;
             var idx: c_int = 1;
             for (parents) |p| {
                 const pkv = @field(p, pk_cols[0]); // single-PK only
-                try stmt.bindAny(idx, pkv, null);
+                try stmt.bindAny(idx, pkv, self.diag);
                 idx += 1;
             }
 
@@ -1826,7 +1905,7 @@ pub fn Repo(comptime T: type) type {
                 const rc = c.sqlite3_step(stmt.stmt);
                 switch (rc) {
                     c.SQLITE_ROW => {
-                        const row = try decodeRow(ChildT, &stmt, self.alloc);
+                        const row = try decodeRow(ChildT, stmt, self.alloc);
                         const key = stmt.columnI64(fk_col_idx);
                         const gop = map.getOrPut(key) catch return error.OutOfMemory;
                         if (!gop.found_existing) gop.value_ptr.* = .empty;
@@ -1862,16 +1941,16 @@ pub fn Repo(comptime T: type) type {
         }
 
         pub fn query(self: Self) QueryBuilder(T) {
-            return QueryBuilder(T).init(self.conn, self.alloc);
+            return .{ .conn = self.conn, .alloc = self.alloc, .diag = self.diag };
         }
 
         /// Run `CREATE TABLE IF NOT EXISTS` + any `CREATE INDEX` from .indexes config.
         pub fn createTable(self: Self) Error!void {
             const ddl = comptime schema.createTable(T, table);
-            try self.conn.execNoArgs(ddl, null);
+            try self.conn.execNoArgs(ddl, self.diag);
             const idx_stmts = comptime schema.createIndexes(T, table);
             inline for (idx_stmts) |stmt| {
-                try self.conn.execNoArgs(stmt, null);
+                try self.conn.execNoArgs(stmt, self.diag);
             }
         }
     };
@@ -1896,6 +1975,7 @@ pub fn QueryBuilder(comptime T: type) type {
     return struct {
         conn: *Conn,
         alloc: Allocator,
+        diag: ?*Diag = null,
 
         const Self = @This();
         const table = entityTable(T);
@@ -1908,12 +1988,12 @@ pub fn QueryBuilder(comptime T: type) type {
         /// Returns a typed where-clause buffer with `.orderBy(...).limit(...).all()`.
         /// `conds` is an anon struct: field name = column, value = scalar (eq) or op marker.
         pub fn where(self: Self, conds: anytype) Where(T, @TypeOf(conds)) {
-            return Where(T, @TypeOf(conds)){ .conn = self.conn, .alloc = self.alloc, .conds = conds };
+            return Where(T, @TypeOf(conds)){ .conn = self.conn, .alloc = self.alloc, .conds = conds, .diag = self.diag };
         }
 
         pub fn all(self: Self) Error![]T {
             const sql_text = comptime ("SELECT " ++ all_cols ++ " FROM " ++ table ++ ";\x00")[0 .. ("SELECT " ++ all_cols ++ " FROM " ++ table ++ ";").len :0];
-            return try collectAll(T, self.conn, sql_text, .{}, self.alloc);
+            return try collectAll(T, self.conn, sql_text, .{}, self.alloc, self.diag);
         }
     };
 }
@@ -1924,15 +2004,16 @@ fn collectAll(
     comptime sql_text: [:0]const u8,
     args: anytype,
     alloc: Allocator,
+    diag: ?*Diag,
 ) Error![]T {
-    var it = try conn.query(T, sql_text, args, alloc, null);
+    var it = try conn.query(T, sql_text, args, alloc, diag);
     defer it.deinit();
     var list: std.ArrayList(T) = .empty;
     errdefer {
         for (list.items) |row| freeRow(T, alloc, row);
         list.deinit(alloc);
     }
-    while (try it.next(null)) |row| {
+    while (try it.next(diag)) |row| {
         list.append(alloc, row) catch return error.OutOfMemory;
     }
     return list.toOwnedSlice(alloc) catch return error.OutOfMemory;
@@ -1947,6 +2028,7 @@ fn Where(comptime T: type, comptime Conds: type) type {
         conn: *Conn,
         alloc: Allocator,
         conds: Conds,
+        diag: ?*Diag = null,
         order_clause: []const u8 = "",
         limit_n: ?i64 = null,
         offset_n: ?i64 = null,
@@ -2031,16 +2113,16 @@ fn Where(comptime T: type, comptime Conds: type) type {
             buf.append(self.alloc, 0) catch return error.OutOfMemory;
             const sql_text = buf.items[0 .. buf.items.len - 1 :0];
 
-            var stmt = try self.conn.prepare(sql_text, null);
+            var stmt = try self.conn.prepare(sql_text, self.diag);
             defer stmt.deinit();
             try self.bindConds(&stmt);
             var next_idx: c_int = @intCast(placeholderCount() + 1);
             if (self.limit_n) |n| {
-                try stmt.bindAny(next_idx, n, null);
+                try stmt.bindAny(next_idx, n, self.diag);
                 next_idx += 1;
             }
             if (self.offset_n) |n| {
-                try stmt.bindAny(next_idx, n, null);
+                try stmt.bindAny(next_idx, n, self.diag);
             }
 
             var list: std.ArrayList(T) = .empty;
@@ -2074,7 +2156,7 @@ fn Where(comptime T: type, comptime Conds: type) type {
             const base = comptime "SELECT COUNT(*) FROM " ++ table ++ " WHERE " ++ w;
             const sql_with_term = base ++ ";";
             const sql_text = comptime (sql_with_term ++ "\x00")[0..sql_with_term.len :0];
-            var stmt = try self.conn.prepare(sql_text, null);
+            var stmt = try self.conn.prepare(sql_text, self.diag);
             defer stmt.deinit();
             try self.bindConds(&stmt);
             const rc = c.sqlite3_step(stmt.stmt);
@@ -2088,7 +2170,7 @@ fn Where(comptime T: type, comptime Conds: type) type {
             const base = comptime "DELETE FROM " ++ table ++ " WHERE " ++ w;
             const sql_with_term = base ++ ";";
             const sql_text = comptime (sql_with_term ++ "\x00")[0..sql_with_term.len :0];
-            var stmt = try self.conn.prepare(sql_text, null);
+            var stmt = try self.conn.prepare(sql_text, self.diag);
             defer stmt.deinit();
             try self.bindConds(&stmt);
             try stmt.execDone(null);
@@ -2754,6 +2836,74 @@ test "ops: notIn + notBetween + glob" {
     defer repo.freeAll(glob_match);
     try testing.expectEqual(@as(usize, 1), glob_match.len);
     try testing.expectEqualStrings("alpha", glob_match[0].name);
+}
+
+test "nested savepoints" {
+    var db = try Conn.open(.{ .path = null, .app_defaults = false });
+    defer db.close();
+    try db.execNoArgs("CREATE TABLE t(x INTEGER);", null);
+
+    var outer = try db.begin();
+    errdefer outer.rollback();
+    try db.exec("INSERT INTO t VALUES(?);", .{@as(i64, 1)}, null);
+
+    {
+        var inner = try db.begin(); // SAVEPOINT
+        try db.exec("INSERT INTO t VALUES(?);", .{@as(i64, 99)}, null);
+        inner.rollback(); // discard 99
+    }
+
+    try db.exec("INSERT INTO t VALUES(?);", .{@as(i64, 2)}, null);
+    try outer.commit();
+
+    const Row = struct { x: i64 };
+    const r = try db.queryOne(Row, "SELECT COUNT(*) FROM t;", .{}, testing.allocator, null);
+    try testing.expectEqual(@as(i64, 2), r.?.x);
+    try testing.expectEqual(@as(u32, 0), db.tx_depth);
+}
+
+test "Repo diag captures sqlite errmsg" {
+    const alloc = testing.allocator;
+    var db = try Conn.open(.{ .path = null, .app_defaults = false });
+    defer db.close();
+    const Uniq = struct {
+        id: ?i64,
+        name: []const u8,
+        pub const sqlite = .{ .table = "uniq", .primary_key = .id, .autoincrement = true, .unique = &.{.name} };
+    };
+    const repo = Repo(Uniq).init(&db, alloc);
+    try repo.createTable();
+    const r = try repo.insert(.{ .name = @as([]const u8, "x") });
+    defer freeRow(Uniq, alloc, r);
+
+    var diag: Diag = .{};
+    const dup_repo = repo.withDiag(&diag);
+    const dup = dup_repo.insert(.{ .name = @as([]const u8, "x") });
+    try testing.expectError(error.SqliteConstraint, dup);
+    try testing.expect(diag.msg.len > 0);
+}
+
+test "Repo with cache: integration works" {
+    const alloc = testing.allocator;
+    var db = try Conn.open(.{ .path = null, .app_defaults = false });
+    defer db.close();
+    try db.enableCache(alloc);
+    const repo = Repo(Person).init(&db, alloc);
+    try repo.createTable();
+    var i: i64 = 0;
+    while (i < 5) : (i += 1) {
+        var name_buf: [4]u8 = undefined;
+        const n = std.fmt.bufPrint(&name_buf, "n{d}", .{i}) catch unreachable;
+        const row = try repo.insert(.{ .name = n, .age = @as(?u32, @intCast(i)) });
+        freeRow(Person, alloc, row);
+    }
+    // Repeated finds reuse cached stmt.
+    var j: i64 = 1;
+    while (j <= 5) : (j += 1) {
+        const r = (try repo.find(j)).?;
+        defer freeRow(Person, alloc, r);
+    }
+    try testing.expectEqual(@as(i64, 5), try repo.count());
 }
 
 test "Pool: acquire + release" {
