@@ -126,10 +126,89 @@ defer repo.freeAll(adults);
 ```
 
 **Operators** (`sql.op`): `eq`, `neq`, `lt`, `lte`, `gt`, `gte`, `like`,
-`isNull`, `notNull`. Bare values in `.where(.{...})` mean equality.
+`isNull`, `notNull`, `in(.{...})`, `between(lo, hi)`. Bare values in
+`.where(.{...})` mean equality.
 
 **Query builder methods**: `.where(...)`, `.orderBy(.field, .asc/.desc)`,
 `.limit(n)`, `.offset(n)`, `.all()`, `.first()`, `.count()`, `.delete()`.
+
+### Timestamps + soft delete
+
+```zig
+const Item = struct {
+    id: ?i64,
+    name: []const u8,
+    created_at: ?i64,
+    updated_at: ?i64,
+    deleted_at: ?i64,
+    pub const sqlite = .{
+        .table = "item",
+        .primary_key = .id,
+        .autoincrement = true,
+        .timestamps = .{ .created_at = .created_at, .updated_at = .updated_at },
+        .soft_delete = .deleted_at,
+    };
+};
+```
+
+- `insert` auto-populates `created_at` + `updated_at` (unix epoch seconds).
+- `update` auto-bumps `updated_at`.
+- `delete` sets `deleted_at = now()`; rows hidden from `find`, `all`, `query`.
+- `deleteHard` for true DELETE.
+- `restore` clears `deleted_at`.
+- `findIncludingDeleted` reads soft-deleted rows.
+
+### Relations
+
+```zig
+const posts = try userRepo.hasMany(Post, "user_id", alice.id.?);
+defer postRepo.freeAll(posts);
+```
+
+### JSON columns
+
+```zig
+const Cfg = struct { theme: []const u8, count: u32 };
+const Doc = struct {
+    id: ?i64,
+    config: sql.Json(Cfg),
+    pub const sqlite = .{ .table = "doc", .primary_key = .id, .autoincrement = true };
+};
+
+const j = try sql.Json(Cfg).encode(alloc, .{ .theme = "dark", .count = 3 });
+defer j.free(alloc);
+const doc = try repo.insert(.{ .config = j });
+// ...
+const parsed = try got.config.parse(alloc);
+defer parsed.deinit();
+parsed.value.theme; // "dark"
+```
+
+### Connection pool
+
+```zig
+var pool = try sql.Pool.init(alloc, .{ .path = "./app.db" }, 4);
+defer pool.deinit();
+
+const conn = pool.acquire();
+defer pool.release(conn);
+try conn.exec("INSERT INTO t VALUES(?);", .{42}, null);
+```
+
+`acquire` blocks until a connection is free. WAL mode lets multiple readers
+run concurrently with one writer.
+
+### Arena allocation
+
+`query` / `Repo` accept any `Allocator`. Pass an arena to skip per-row
+`freeRow`/`freeAll` cleanup:
+
+```zig
+var arena = std.heap.ArenaAllocator.init(gpa);
+defer arena.deinit();
+const rows = try repo.query().where(.{...}).all();
+// no freeAll needed — arena.deinit handles all row slices.
+```
 
 ## Type mapping
 
