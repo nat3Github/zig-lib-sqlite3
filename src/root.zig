@@ -633,7 +633,7 @@ pub fn Json(comptime T: type) type {
         const JsonSelf = @This();
 
         pub fn encode(alloc: Allocator, value: T) Error!JsonSelf {
-            const bytes = std.json.stringifyAlloc(alloc, value, .{}) catch return error.OutOfMemory;
+            const bytes = std.json.Stringify.valueAlloc(alloc, value, .{}) catch return error.OutOfMemory;
             return .{ .bytes = bytes };
         }
 
@@ -1665,25 +1665,25 @@ pub fn Repo(comptime T: type) type {
             parents: []const T,
         ) Error!std.AutoHashMap(i64, []ChildT) {
             // Build "?, ?, ?" placeholder list at runtime (length depends on parents.len).
-            var sql_buf = std.ArrayList(u8).init(self.alloc);
-            defer sql_buf.deinit();
+            var sql_buf: std.ArrayList(u8) = .empty;
+            defer sql_buf.deinit(self.alloc);
             const child_table = comptime entityTable(ChildT);
             const child_cols = comptime columnList(ChildT);
             const cond = comptime aliveFilter(ChildT);
-            sql_buf.appendSlice("SELECT " ++ child_cols ++ " FROM " ++ child_table ++ " WHERE " ++ fk_field ++ " IN (") catch return error.OutOfMemory;
+            sql_buf.appendSlice(self.alloc, "SELECT " ++ child_cols ++ " FROM " ++ child_table ++ " WHERE " ++ fk_field ++ " IN (") catch return error.OutOfMemory;
             if (parents.len == 0) {
-                sql_buf.appendSlice("NULL)") catch return error.OutOfMemory;
+                sql_buf.appendSlice(self.alloc, "NULL)") catch return error.OutOfMemory;
             } else {
                 for (parents, 0..) |_, i| {
-                    if (i > 0) sql_buf.appendSlice(", ") catch return error.OutOfMemory;
-                    sql_buf.append('?') catch return error.OutOfMemory;
+                    if (i > 0) sql_buf.appendSlice(self.alloc, ", ") catch return error.OutOfMemory;
+                    sql_buf.append(self.alloc, '?') catch return error.OutOfMemory;
                 }
-                sql_buf.append(')') catch return error.OutOfMemory;
+                sql_buf.append(self.alloc, ')') catch return error.OutOfMemory;
             }
-            sql_buf.appendSlice(" AND ") catch return error.OutOfMemory;
-            sql_buf.appendSlice(cond) catch return error.OutOfMemory;
-            sql_buf.append(';') catch return error.OutOfMemory;
-            sql_buf.append(0) catch return error.OutOfMemory;
+            sql_buf.appendSlice(self.alloc, " AND ") catch return error.OutOfMemory;
+            sql_buf.appendSlice(self.alloc, cond) catch return error.OutOfMemory;
+            sql_buf.append(self.alloc, ';') catch return error.OutOfMemory;
+            sql_buf.append(self.alloc, 0) catch return error.OutOfMemory;
             const sql_text = sql_buf.items[0 .. sql_buf.items.len - 1 :0];
 
             var stmt = try self.conn.prepare(sql_text, null);
@@ -1708,7 +1708,7 @@ pub fn Repo(comptime T: type) type {
                 var it = map.valueIterator();
                 while (it.next()) |v| {
                     for (v.items) |row| freeRow(ChildT, self.alloc, row);
-                    v.deinit();
+                    v.deinit(self.alloc);
                 }
                 map.deinit();
             }
@@ -1719,8 +1719,8 @@ pub fn Repo(comptime T: type) type {
                         const row = try decodeRow(ChildT, &stmt, self.alloc);
                         const key = stmt.columnI64(fk_col_idx);
                         const gop = map.getOrPut(key) catch return error.OutOfMemory;
-                        if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(ChildT).init(self.alloc);
-                        gop.value_ptr.append(row) catch return error.OutOfMemory;
+                        if (!gop.found_existing) gop.value_ptr.* = .empty;
+                        gop.value_ptr.append(self.alloc, row) catch return error.OutOfMemory;
                     },
                     c.SQLITE_DONE => break,
                     else => try codeToError(rc),
@@ -1738,7 +1738,7 @@ pub fn Repo(comptime T: type) type {
             }
             var iter = map.iterator();
             while (iter.next()) |entry| {
-                const slice = entry.value_ptr.toOwnedSlice() catch return error.OutOfMemory;
+                const slice = entry.value_ptr.toOwnedSlice(self.alloc) catch return error.OutOfMemory;
                 out.put(entry.key_ptr.*, slice) catch return error.OutOfMemory;
             }
             map.deinit();
@@ -1817,15 +1817,15 @@ fn collectAll(
 ) Error![]T {
     var it = try conn.query(T, sql_text, args, alloc, null);
     defer it.deinit();
-    var list = std.ArrayList(T).init(alloc);
+    var list: std.ArrayList(T) = .empty;
     errdefer {
         for (list.items) |row| freeRow(T, alloc, row);
-        list.deinit();
+        list.deinit(alloc);
     }
     while (try it.next(null)) |row| {
-        list.append(row) catch return error.OutOfMemory;
+        list.append(alloc, row) catch return error.OutOfMemory;
     }
-    return list.toOwnedSlice() catch return error.OutOfMemory;
+    return list.toOwnedSlice(alloc) catch return error.OutOfMemory;
 }
 
 /// Build WHERE clause SQL fragment + bind tuple from a struct of conditions.
@@ -1905,14 +1905,14 @@ fn Where(comptime T: type, comptime Conds: type) type {
             const has_off = self.offset_n != null;
 
             // Build full SQL with std.fmt at runtime (small alloc).
-            var buf = std.ArrayList(u8).init(self.alloc);
-            defer buf.deinit();
-            buf.appendSlice(base) catch return error.OutOfMemory;
-            buf.appendSlice(ord) catch return error.OutOfMemory;
-            if (has_lim) buf.appendSlice(" LIMIT ?") catch return error.OutOfMemory;
-            if (has_off) buf.appendSlice(" OFFSET ?") catch return error.OutOfMemory;
-            buf.append(';') catch return error.OutOfMemory;
-            buf.append(0) catch return error.OutOfMemory;
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(self.alloc);
+            buf.appendSlice(self.alloc, base) catch return error.OutOfMemory;
+            buf.appendSlice(self.alloc, ord) catch return error.OutOfMemory;
+            if (has_lim) buf.appendSlice(self.alloc, " LIMIT ?") catch return error.OutOfMemory;
+            if (has_off) buf.appendSlice(self.alloc, " OFFSET ?") catch return error.OutOfMemory;
+            buf.append(self.alloc, ';') catch return error.OutOfMemory;
+            buf.append(self.alloc, 0) catch return error.OutOfMemory;
             const sql_text = buf.items[0 .. buf.items.len - 1 :0];
 
             var stmt = try self.conn.prepare(sql_text, null);
@@ -1927,23 +1927,23 @@ fn Where(comptime T: type, comptime Conds: type) type {
                 try stmt.bindAny(next_idx, n, null);
             }
 
-            var list = std.ArrayList(T).init(self.alloc);
+            var list: std.ArrayList(T) = .empty;
             errdefer {
                 for (list.items) |row| freeRow(T, self.alloc, row);
-                list.deinit();
+                list.deinit(self.alloc);
             }
             while (true) {
                 const rc = c.sqlite3_step(stmt.stmt);
                 switch (rc) {
                     c.SQLITE_ROW => {
                         const row = try decodeRow(T, &stmt, self.alloc);
-                        list.append(row) catch return error.OutOfMemory;
+                        list.append(self.alloc, row) catch return error.OutOfMemory;
                     },
                     c.SQLITE_DONE => break,
                     else => try codeToError(rc),
                 }
             }
-            return list.toOwnedSlice() catch return error.OutOfMemory;
+            return list.toOwnedSlice(self.alloc) catch return error.OutOfMemory;
         }
 
         pub fn first(self: Self) Error!?T {
@@ -2314,7 +2314,7 @@ test "timestamps: created_at + updated_at" {
     try testing.expect(r1.created_at != null);
     try testing.expect(r1.updated_at != null);
 
-    std.time.sleep(std.time.ns_per_ms * 1100); // ensure timestamp advances
+    std.Thread.sleep(std.time.ns_per_ms * 1100); // ensure timestamp advances
     try repo.update(r1.id.?, .{ .name = @as([]const u8, "bar") });
     const r2 = (try repo.find(r1.id.?)).?;
     defer freeRow(Item, alloc, r2);
