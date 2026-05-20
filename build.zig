@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
     sqlite3_module.link_libc = true;
     sqlite3_module.addIncludePath(b.path("sqlite-src"));
     sqlite3_module.addCSourceFile(.{ .file = b.path("sqlite-src/sqlite3.c") });
+    sqlite3_module.addCSourceFile(.{ .file = b.path("src/sqlite_bridge.c") });
 
     const test_lib = b.addTest(.{
         .root_module = sqlite3_module,
@@ -29,7 +30,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .target = target,
     });
-    exe.root_module.addImport("sqlite3-zig", sqlite3_module);
+    exe.root_module.addImport("sqlite3", sqlite3_module);
 
     const run_exe = b.addRunArtifact(exe);
     run_step.dependOn(&run_exe.step);

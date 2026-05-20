@@ -1,21 +1,38 @@
 const std = @import("std");
-const dbs = @import("sqlite3-zig").c;
-pub fn main() !void {
-    var dbhandle: ?*dbs.sqlite3 = undefined;
-    defer {
-        const close_res = dbs.sqlite3_close(dbhandle);
-        if (close_res != dbs.SQLITE_OK) {
-            std.debug.print("failed to close db\n", .{});
-        } else {
-            std.debug.print("successfully closed db\n", .{});
-        }
-    }
+const sql = @import("sqlite3");
 
-    const db_res = dbs.sqlite3_open(":memory:", &dbhandle);
-    if (db_res != dbs.SQLITE_OK) {
-        std.debug.print("sqlite error: {}\n", .{db_res});
-        return error.FAILED_TO_OPEN_SQLITE_DB;
-    } else {
-        std.debug.print("opened in memory sqlite3 database, returned SQLITE_OK\n", .{});
+const User = struct {
+    id: ?i64,
+    name: []const u8,
+    age: ?u32,
+    pub const sqlite = .{
+        .primary_key = .id,
+        .autoincrement = true,
+        .unique = &.{.name},
+    };
+};
+
+pub fn main() !void {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var db = try sql.Conn.open(.{ .path = null, .app_defaults = false });
+    defer db.close();
+
+    const migrations = [_][]const u8{
+        comptime sql.schema.createTable(User, "user"),
+    };
+    try db.migrate(&migrations);
+
+    const ins = comptime sql.schema.insert(User, "user", &.{"id"});
+    try db.exec(ins, .{ "alice", @as(?u32, 30) }, null);
+    try db.exec(ins, .{ "bob", @as(?u32, null) }, null);
+
+    var it = try db.query(User, "SELECT id, name, age FROM user ORDER BY id;", .{}, alloc, null);
+    defer it.deinit();
+    while (try it.next(null)) |row| {
+        defer sql.freeRow(User, alloc, row);
+        std.debug.print("id={?} name={s} age={?}\n", .{ row.id, row.name, row.age });
     }
 }
