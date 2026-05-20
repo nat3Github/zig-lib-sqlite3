@@ -6,6 +6,7 @@ const User = struct {
     name: []const u8,
     age: ?u32,
     pub const sqlite = .{
+        .table = "user",
         .primary_key = .id,
         .autoincrement = true,
         .unique = &.{.name},
@@ -20,19 +21,27 @@ pub fn main() !void {
     var db = try sql.Conn.open(.{ .path = null, .app_defaults = false });
     defer db.close();
 
-    const migrations = [_][]const u8{
-        comptime sql.schema.createTable(User, "user"),
-    };
-    try db.migrate(&migrations);
+    const repo = sql.Repo(User).init(&db, alloc);
+    try repo.createTable();
 
-    const ins = comptime sql.schema.insert(User, "user", &.{"id"});
-    try db.exec(ins, .{ "alice", @as(?u32, 30) }, null);
-    try db.exec(ins, .{ "bob", @as(?u32, null) }, null);
+    const alice = try repo.insert(.{ .name = @as([]const u8, "alice"), .age = @as(?u32, 30) });
+    defer sql.freeRow(User, alloc, alice);
+    const bob = try repo.insert(.{ .name = @as([]const u8, "bob"), .age = @as(?u32, null) });
+    defer sql.freeRow(User, alloc, bob);
+    const carol = try repo.insert(.{ .name = @as([]const u8, "carol"), .age = @as(?u32, 25) });
+    defer sql.freeRow(User, alloc, carol);
 
-    var it = try db.query(User, "SELECT id, name, age FROM user ORDER BY id;", .{}, alloc, null);
-    defer it.deinit();
-    while (try it.next(null)) |row| {
-        defer sql.freeRow(User, alloc, row);
-        std.debug.print("id={?} name={s} age={?}\n", .{ row.id, row.name, row.age });
+    std.debug.print("count = {}\n", .{try repo.count()});
+
+    const adults = try repo.query()
+        .where(.{ .age = sql.op.gte(@as(u32, 18)) })
+        .orderBy(.age, .desc)
+        .all();
+    defer repo.freeAll(adults);
+    for (adults) |u| std.debug.print("adult: id={?} name={s} age={?}\n", .{ u.id, u.name, u.age });
+
+    if (try repo.findBy(.name, "alice")) |found| {
+        defer sql.freeRow(User, alloc, found);
+        std.debug.print("found alice: id={?}\n", .{found.id});
     }
 }

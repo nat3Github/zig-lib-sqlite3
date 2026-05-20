@@ -141,6 +141,7 @@ pub const OpenOptions = struct {
 
 pub const Conn = struct {
     db: *c.sqlite3,
+    cache: ?*StmtCache = null,
 
     pub fn open(opts: OpenOptions) Error!Conn {
         var raw: ?*c.sqlite3 = null;
@@ -172,8 +173,49 @@ pub const Conn = struct {
     }
 
     pub fn close(self: *Conn) void {
+        if (self.cache) |cache| {
+            cache.deinit();
+            cache.alloc.destroy(cache);
+            self.cache = null;
+        }
         // sqlite3_close_v2 defers close if statements still live.
         _ = c.sqlite3_close_v2(self.db);
+    }
+
+    /// Enable a statement cache. Subsequent `execCached` / `queryCached` will
+    /// reuse prepared statements keyed by SQL string.
+    pub fn enableCache(self: *Conn, alloc: Allocator) Error!void {
+        if (self.cache != null) return;
+        const cache = alloc.create(StmtCache) catch return error.OutOfMemory;
+        cache.* = StmtCache.init(alloc, self.db);
+        self.cache = cache;
+    }
+
+    /// Cached variant of `exec`. Requires `enableCache` first.
+    pub fn execCached(self: *Conn, comptime sql: [:0]const u8, args: anytype, diag: ?*Diag) Error!void {
+        const cache = self.cache orelse return error.SqliteMisuse;
+        const stmt = try cache.getOrPrepare(sql);
+        try stmt.reset();
+        stmt.clearBindings();
+        try stmt.bindAll(args, diag);
+        try stmt.execDone(diag);
+    }
+
+    /// Cached variant of `query`. Iterator does NOT own the statement.
+    pub fn queryCached(
+        self: *Conn,
+        comptime Row: type,
+        comptime sql: []const u8,
+        args: anytype,
+        alloc: Allocator,
+        diag: ?*Diag,
+    ) Error!Iterator(Row) {
+        const cache = self.cache orelse return error.SqliteMisuse;
+        const stmt = try cache.getOrPrepare(sql);
+        try stmt.reset();
+        stmt.clearBindings();
+        try stmt.bindAll(args, diag);
+        return Iterator(Row){ .stmt = stmt.*, .alloc = alloc, .owns_stmt = false };
     }
 
     /// Run a SQL string with no parameters and no row collection.
@@ -780,6 +822,513 @@ fn sha256(input: []const u8) [32]u8 {
 }
 
 // ============================================================================
+// Statement cache
+// ============================================================================
+
+/// Caches prepared statements keyed by SQL text. Each call to `getOrPrepare`
+/// returns the same `*Stmt`; caller is responsible for `reset`+`clearBindings`
+/// before reuse (Conn.execCached / queryCached do this).
+pub const StmtCache = struct {
+    map: std.StringHashMap(*Stmt),
+    alloc: Allocator,
+    db: *c.sqlite3,
+
+    pub fn init(alloc: Allocator, db: *c.sqlite3) StmtCache {
+        return .{ .map = std.StringHashMap(*Stmt).init(alloc), .alloc = alloc, .db = db };
+    }
+
+    pub fn deinit(self: *StmtCache) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            self.alloc.destroy(entry.value_ptr.*);
+        }
+        self.map.deinit();
+    }
+
+    pub fn getOrPrepare(self: *StmtCache, sql: []const u8) Error!*Stmt {
+        if (self.map.get(sql)) |s| return s;
+        var raw: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &raw, null);
+        try codeToError(rc);
+        const stmt = raw orelse return error.SqliteError;
+        const boxed = self.alloc.create(Stmt) catch return error.OutOfMemory;
+        boxed.* = Stmt{ .stmt = stmt, .db = self.db };
+        self.map.put(sql, boxed) catch return error.OutOfMemory;
+        return boxed;
+    }
+};
+
+// ============================================================================
+// Query operators
+// ============================================================================
+
+/// SQL operator markers. Use as `op.gte(18)`, `op.like("a%")`, etc.
+/// Comptime detected via the `sql_op` decl.
+pub const op = struct {
+    fn Op(comptime opstr: []const u8, comptime T: type) type {
+        return struct {
+            v: T,
+            pub const sql_op: []const u8 = opstr;
+            pub const sql_is_null = false;
+        };
+    }
+
+    pub fn eq(v: anytype) Op("=", @TypeOf(v)) {
+        return .{ .v = v };
+    }
+    pub fn neq(v: anytype) Op("!=", @TypeOf(v)) {
+        return .{ .v = v };
+    }
+    pub fn lt(v: anytype) Op("<", @TypeOf(v)) {
+        return .{ .v = v };
+    }
+    pub fn lte(v: anytype) Op("<=", @TypeOf(v)) {
+        return .{ .v = v };
+    }
+    pub fn gt(v: anytype) Op(">", @TypeOf(v)) {
+        return .{ .v = v };
+    }
+    pub fn gte(v: anytype) Op(">=", @TypeOf(v)) {
+        return .{ .v = v };
+    }
+    pub fn like(v: []const u8) Op("LIKE", []const u8) {
+        return .{ .v = v };
+    }
+
+    pub const IsNull = struct {
+        pub const sql_op: []const u8 = "IS NULL";
+        pub const sql_is_null = true;
+    };
+    pub const NotNull = struct {
+        pub const sql_op: []const u8 = "IS NOT NULL";
+        pub const sql_is_null = true;
+    };
+    pub const isNull = IsNull{};
+    pub const notNull = NotNull{};
+
+    fn isOpType(comptime T: type) bool {
+        return @hasDecl(T, "sql_op");
+    }
+};
+
+// ============================================================================
+// Repo + Query (ORM-ish layer)
+// ============================================================================
+
+fn entityCfg(comptime T: type) type {
+    if (!@hasDecl(T, "sqlite")) @compileError(@typeName(T) ++ " missing `pub const sqlite = .{...}` decl");
+    return @TypeOf(T.sqlite);
+}
+
+fn entityTable(comptime T: type) []const u8 {
+    const cfg = T.sqlite;
+    if (@hasField(entityCfg(T), "table")) return cfg.table;
+    // default: lowercased type name.
+    const name = @typeName(T);
+    // strip leading namespace dots if any.
+    var last_dot: usize = 0;
+    for (name, 0..) |ch, i| if (ch == '.') {
+        last_dot = i + 1;
+    };
+    return name[last_dot..];
+}
+
+fn entityPk(comptime T: type) []const u8 {
+    const cfg = T.sqlite;
+    if (@hasField(entityCfg(T), "primary_key")) return @tagName(cfg.primary_key);
+    @compileError(@typeName(T) ++ ": sqlite config missing .primary_key");
+}
+
+fn entityAutoinc(comptime T: type) bool {
+    const cfg = T.sqlite;
+    if (@hasField(entityCfg(T), "autoincrement")) return cfg.autoincrement;
+    return false;
+}
+
+fn fieldType(comptime T: type, comptime name: []const u8) type {
+    inline for (@typeInfo(T).@"struct".fields) |f| {
+        if (std.mem.eql(u8, f.name, name)) return f.type;
+    }
+    @compileError(@typeName(T) ++ " has no field " ++ name);
+}
+
+/// Comma-separated column list for a struct's fields.
+fn columnList(comptime T: type) []const u8 {
+    comptime {
+        const fields = @typeInfo(T).@"struct".fields;
+        var s: []const u8 = "";
+        for (fields, 0..) |f, i| {
+            if (i > 0) s = s ++ ", ";
+            s = s ++ f.name;
+        }
+        return s;
+    }
+}
+
+pub fn Repo(comptime T: type) type {
+    return struct {
+        conn: *Conn,
+        alloc: Allocator,
+
+        const Self = @This();
+        const table = entityTable(T);
+        const pk = entityPk(T);
+        const all_cols = columnList(T);
+
+        pub fn init(conn: *Conn, alloc: Allocator) Self {
+            return .{ .conn = conn, .alloc = alloc };
+        }
+
+        /// Insert. `values` is an anon struct with a subset of T's fields.
+        /// Returns the inserted row with PK populated (if autoincrement).
+        pub fn insert(self: Self, values: anytype) Error!T {
+            const V = @TypeOf(values);
+            const v_fields = @typeInfo(V).@"struct".fields;
+            comptime var cols: []const u8 = "";
+            comptime var qs: []const u8 = "";
+            comptime {
+                for (v_fields, 0..) |f, i| {
+                    if (i > 0) {
+                        cols = cols ++ ", ";
+                        qs = qs ++ ", ";
+                    }
+                    cols = cols ++ f.name;
+                    qs = qs ++ "?";
+                }
+            }
+            const sql_text = comptime ("INSERT INTO " ++ table ++ "(" ++ cols ++ ") VALUES(" ++ qs ++ ");\x00")[0 .. ("INSERT INTO " ++ table ++ "(" ++ cols ++ ") VALUES(" ++ qs ++ ");").len :0];
+
+            var stmt = try self.conn.prepare(sql_text, null);
+            defer stmt.deinit();
+            try stmt.bindAll(values, null);
+            try stmt.execDone(null);
+
+            const rowid = self.conn.lastInsertRowid();
+            // Fetch back to populate any defaults / autoincrement PK.
+            return (try self.findRowid(rowid)) orelse error.SqliteError;
+        }
+
+        /// Find by primary key value.
+        pub fn find(self: Self, pk_value: anytype) Error!?T {
+            const sql_text = comptime ("SELECT " ++ all_cols ++ " FROM " ++ table ++ " WHERE " ++ pk ++ " = ?;\x00")[0 .. ("SELECT " ++ all_cols ++ " FROM " ++ table ++ " WHERE " ++ pk ++ " = ?;").len :0];
+            return try self.conn.queryOne(T, sql_text, .{pk_value}, self.alloc, null);
+        }
+
+        /// Find by sqlite rowid (used internally after insert).
+        fn findRowid(self: Self, rowid: i64) Error!?T {
+            const sql_text = comptime ("SELECT " ++ all_cols ++ " FROM " ++ table ++ " WHERE rowid = ?;\x00")[0 .. ("SELECT " ++ all_cols ++ " FROM " ++ table ++ " WHERE rowid = ?;").len :0];
+            return try self.conn.queryOne(T, sql_text, .{rowid}, self.alloc, null);
+        }
+
+        /// Find first row matching exact field equality.
+        pub fn findBy(self: Self, comptime field: std.meta.FieldEnum(T), value: anytype) Error!?T {
+            const fname = @tagName(field);
+            const sql_text = comptime ("SELECT " ++ all_cols ++ " FROM " ++ table ++ " WHERE " ++ fname ++ " = ?;\x00")[0 .. ("SELECT " ++ all_cols ++ " FROM " ++ table ++ " WHERE " ++ fname ++ " = ?;").len :0];
+            return try self.conn.queryOne(T, sql_text, .{value}, self.alloc, null);
+        }
+
+        /// Fetch all rows. Caller owns slice + slice fields; use `freeAll`.
+        pub fn all(self: Self) Error![]T {
+            const sql_text = comptime ("SELECT " ++ all_cols ++ " FROM " ++ table ++ ";\x00")[0 .. ("SELECT " ++ all_cols ++ " FROM " ++ table ++ ";").len :0];
+            var it = try self.conn.query(T, sql_text, .{}, self.alloc, null);
+            defer it.deinit();
+            var list = std.ArrayList(T).init(self.alloc);
+            errdefer {
+                for (list.items) |row| freeRow(T, self.alloc, row);
+                list.deinit();
+            }
+            while (try it.next(null)) |row| {
+                list.append(row) catch return error.OutOfMemory;
+            }
+            return list.toOwnedSlice() catch return error.OutOfMemory;
+        }
+
+        /// Count rows.
+        pub fn count(self: Self) Error!i64 {
+            const sql_text = comptime ("SELECT COUNT(*) FROM " ++ table ++ ";\x00")[0 .. ("SELECT COUNT(*) FROM " ++ table ++ ";").len :0];
+            const Row = struct { c: i64 };
+            const r = try self.conn.queryOne(Row, sql_text, .{}, self.alloc, null);
+            return if (r) |row| row.c else 0;
+        }
+
+        /// Update fields listed in `changes` for row matching PK.
+        pub fn update(self: Self, pk_value: anytype, changes: anytype) Error!void {
+            const C = @TypeOf(changes);
+            const c_fields = @typeInfo(C).@"struct".fields;
+            if (c_fields.len == 0) @compileError("update: empty changes struct");
+            comptime var sets: []const u8 = "";
+            comptime {
+                for (c_fields, 0..) |f, i| {
+                    if (i > 0) sets = sets ++ ", ";
+                    sets = sets ++ f.name ++ " = ?";
+                }
+            }
+            const sql_str = "UPDATE " ++ table ++ " SET " ++ sets ++ " WHERE " ++ pk ++ " = ?;";
+            const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
+
+            var stmt = try self.conn.prepare(sql_text, null);
+            defer stmt.deinit();
+            inline for (c_fields, 0..) |f, i| {
+                try stmt.bindAny(@intCast(i + 1), @field(changes, f.name), null);
+            }
+            try stmt.bindAny(@intCast(c_fields.len + 1), pk_value, null);
+            try stmt.execDone(null);
+        }
+
+        /// Delete row by PK.
+        pub fn delete(self: Self, pk_value: anytype) Error!void {
+            const sql_text = comptime ("DELETE FROM " ++ table ++ " WHERE " ++ pk ++ " = ?;\x00")[0 .. ("DELETE FROM " ++ table ++ " WHERE " ++ pk ++ " = ?;").len :0];
+            try self.conn.exec(sql_text, .{pk_value}, null);
+        }
+
+        /// Free a slice of rows returned by `all` / `query.all`.
+        pub fn freeAll(self: Self, rows: []T) void {
+            for (rows) |row| freeRow(T, self.alloc, row);
+            self.alloc.free(rows);
+        }
+
+        pub fn query(self: Self) QueryBuilder(T) {
+            return QueryBuilder(T).init(self.conn, self.alloc);
+        }
+
+        /// Run `CREATE TABLE IF NOT EXISTS` for this entity.
+        pub fn createTable(self: Self) Error!void {
+            const ddl = comptime schema.createTable(T, table);
+            try self.conn.execNoArgs(ddl, null);
+        }
+    };
+}
+
+/// Comptime query builder for `Repo(T)`. Methods take comptime spec structs;
+/// SQL is generated at comptime. Bound values flow into a runtime tuple.
+pub fn QueryBuilder(comptime T: type) type {
+    return struct {
+        conn: *Conn,
+        alloc: Allocator,
+
+        const Self = @This();
+        const table = entityTable(T);
+        const all_cols = columnList(T);
+
+        pub fn init(conn: *Conn, alloc: Allocator) Self {
+            return .{ .conn = conn, .alloc = alloc };
+        }
+
+        /// Returns a typed where-clause buffer with `.orderBy(...).limit(...).all()`.
+        /// `conds` is an anon struct: field name = column, value = scalar (eq) or op marker.
+        pub fn where(self: Self, conds: anytype) Where(T, @TypeOf(conds)) {
+            return Where(T, @TypeOf(conds)){ .conn = self.conn, .alloc = self.alloc, .conds = conds };
+        }
+
+        pub fn all(self: Self) Error![]T {
+            const sql_text = comptime ("SELECT " ++ all_cols ++ " FROM " ++ table ++ ";\x00")[0 .. ("SELECT " ++ all_cols ++ " FROM " ++ table ++ ";").len :0];
+            return try collectAll(T, self.conn, sql_text, .{}, self.alloc);
+        }
+    };
+}
+
+fn collectAll(
+    comptime T: type,
+    conn: *Conn,
+    comptime sql_text: [:0]const u8,
+    args: anytype,
+    alloc: Allocator,
+) Error![]T {
+    var it = try conn.query(T, sql_text, args, alloc, null);
+    defer it.deinit();
+    var list = std.ArrayList(T).init(alloc);
+    errdefer {
+        for (list.items) |row| freeRow(T, alloc, row);
+        list.deinit();
+    }
+    while (try it.next(null)) |row| {
+        list.append(row) catch return error.OutOfMemory;
+    }
+    return list.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+/// Build WHERE clause SQL fragment + bind tuple from a struct of conditions.
+/// Each field of `Conds` becomes one predicate:
+/// - field value with `sql_op` decl → `<col> <op> ?` (or `IS NULL` / `IS NOT NULL`)
+/// - any other value → `<col> = ?` (eq)
+fn Where(comptime T: type, comptime Conds: type) type {
+    return struct {
+        conn: *Conn,
+        alloc: Allocator,
+        conds: Conds,
+        order_clause: []const u8 = "",
+        limit_n: ?i64 = null,
+        offset_n: ?i64 = null,
+
+        const Self = @This();
+        const table = entityTable(T);
+        const all_cols = columnList(T);
+
+        /// True iff `FT` is an op marker (has `sql_op` decl). Safe for non-struct types.
+        fn isOp(comptime FT: type) bool {
+            return switch (@typeInfo(FT)) {
+                .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(FT, "sql_op"),
+                else => false,
+            };
+        }
+
+        /// Returns the comptime WHERE clause text (without leading "WHERE ").
+        fn whereSql() []const u8 {
+            return comptime blk: {
+                const fields = @typeInfo(Conds).@"struct".fields;
+                if (fields.len == 0) break :blk "1";
+                var s: []const u8 = "";
+                for (fields, 0..) |f, i| {
+                    if (i > 0) s = s ++ " AND ";
+                    if (isOp(f.type)) {
+                        if (f.type.sql_is_null) {
+                            s = s ++ f.name ++ " " ++ f.type.sql_op;
+                        } else {
+                            s = s ++ f.name ++ " " ++ f.type.sql_op ++ " ?";
+                        }
+                    } else {
+                        s = s ++ f.name ++ " = ?";
+                    }
+                }
+                break :blk s;
+            };
+        }
+
+        /// Returns count of `?` placeholders in WHERE.
+        fn placeholderCount() usize {
+            return comptime blk: {
+                const fields = @typeInfo(Conds).@"struct".fields;
+                var n: usize = 0;
+                for (fields) |f| {
+                    if (isOp(f.type) and f.type.sql_is_null) continue;
+                    n += 1;
+                }
+                break :blk n;
+            };
+        }
+
+        fn bindConds(self: Self, stmt: *Stmt) Error!void {
+            const fields = @typeInfo(Conds).@"struct".fields;
+            comptime var idx: c_int = 1;
+            inline for (fields) |f| {
+                const fv = @field(self.conds, f.name);
+                if (comptime isOp(f.type)) {
+                    if (!f.type.sql_is_null) {
+                        try stmt.bindAny(idx, fv.v, null);
+                        idx += 1;
+                    }
+                } else {
+                    try stmt.bindAny(idx, fv, null);
+                    idx += 1;
+                }
+            }
+        }
+
+        pub fn orderBy(self: Self, comptime field: std.meta.FieldEnum(T), comptime dir: enum { asc, desc }) Self {
+            var copy = self;
+            copy.order_clause = comptime " ORDER BY " ++ @tagName(field) ++ if (dir == .asc) " ASC" else " DESC";
+            return copy;
+        }
+
+        pub fn limit(self: Self, n: i64) Self {
+            var copy = self;
+            copy.limit_n = n;
+            return copy;
+        }
+
+        pub fn offset(self: Self, n: i64) Self {
+            var copy = self;
+            copy.offset_n = n;
+            return copy;
+        }
+
+        /// Execute and collect all rows.
+        pub fn all(self: Self) Error![]T {
+            const w = comptime whereSql();
+            const base = comptime "SELECT " ++ all_cols ++ " FROM " ++ table ++ " WHERE " ++ w;
+            // Pre-compose at comptime parts that don't depend on runtime opts; append at runtime.
+            const ord = self.order_clause;
+            const has_lim = self.limit_n != null;
+            const has_off = self.offset_n != null;
+
+            // Build full SQL with std.fmt at runtime (small alloc).
+            var buf = std.ArrayList(u8).init(self.alloc);
+            defer buf.deinit();
+            buf.appendSlice(base) catch return error.OutOfMemory;
+            buf.appendSlice(ord) catch return error.OutOfMemory;
+            if (has_lim) buf.appendSlice(" LIMIT ?") catch return error.OutOfMemory;
+            if (has_off) buf.appendSlice(" OFFSET ?") catch return error.OutOfMemory;
+            buf.append(';') catch return error.OutOfMemory;
+            buf.append(0) catch return error.OutOfMemory;
+            const sql_text = buf.items[0 .. buf.items.len - 1 :0];
+
+            var stmt = try self.conn.prepare(sql_text, null);
+            defer stmt.deinit();
+            try self.bindConds(&stmt);
+            var next_idx: c_int = @intCast(placeholderCount() + 1);
+            if (self.limit_n) |n| {
+                try stmt.bindAny(next_idx, n, null);
+                next_idx += 1;
+            }
+            if (self.offset_n) |n| {
+                try stmt.bindAny(next_idx, n, null);
+            }
+
+            var list = std.ArrayList(T).init(self.alloc);
+            errdefer {
+                for (list.items) |row| freeRow(T, self.alloc, row);
+                list.deinit();
+            }
+            while (true) {
+                const rc = c.sqlite3_step(stmt.stmt);
+                switch (rc) {
+                    c.SQLITE_ROW => {
+                        const row = try decodeRow(T, &stmt, self.alloc);
+                        list.append(row) catch return error.OutOfMemory;
+                    },
+                    c.SQLITE_DONE => break,
+                    else => try codeToError(rc),
+                }
+            }
+            return list.toOwnedSlice() catch return error.OutOfMemory;
+        }
+
+        pub fn first(self: Self) Error!?T {
+            const rows = try self.limit(1).all();
+            defer self.alloc.free(rows);
+            if (rows.len == 0) return null;
+            return rows[0];
+        }
+
+        pub fn count(self: Self) Error!i64 {
+            const w = comptime whereSql();
+            const base = comptime "SELECT COUNT(*) FROM " ++ table ++ " WHERE " ++ w;
+            const sql_with_term = base ++ ";";
+            const sql_text = comptime (sql_with_term ++ "\x00")[0..sql_with_term.len :0];
+            var stmt = try self.conn.prepare(sql_text, null);
+            defer stmt.deinit();
+            try self.bindConds(&stmt);
+            const rc = c.sqlite3_step(stmt.stmt);
+            if (rc != c.SQLITE_ROW) try codeToError(rc);
+            return stmt.columnI64(0);
+        }
+
+        /// Delete all matching rows.
+        pub fn delete(self: Self) Error!void {
+            const w = comptime whereSql();
+            const base = comptime "DELETE FROM " ++ table ++ " WHERE " ++ w;
+            const sql_with_term = base ++ ";";
+            const sql_text = comptime (sql_with_term ++ "\x00")[0..sql_with_term.len :0];
+            var stmt = try self.conn.prepare(sql_text, null);
+            defer stmt.deinit();
+            try self.bindConds(&stmt);
+            try stmt.execDone(null);
+        }
+    };
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -918,4 +1467,137 @@ test "enum bind + decode" {
     const Row = struct { c: Color };
     const r = try db.queryOne(Row, "SELECT c FROM t;", .{}, alloc, null);
     try testing.expectEqual(Color.green, r.?.c);
+}
+
+// ----- ORM entity used by Repo / Query tests -----
+
+const Person = struct {
+    id: ?i64,
+    name: []const u8,
+    age: ?u32,
+    pub const sqlite = .{
+        .table = "person",
+        .primary_key = .id,
+        .autoincrement = true,
+        .unique = &.{.name},
+    };
+};
+
+test "Repo: insert, find, update, delete, count" {
+    const alloc = testing.allocator;
+    var db = try Conn.open(.{ .path = null, .app_defaults = false });
+    defer db.close();
+
+    const repo = Repo(Person).init(&db, alloc);
+    try repo.createTable();
+
+    const alice = try repo.insert(.{ .name = "alice", .age = @as(?u32, 30) });
+    defer freeRow(Person, alloc, alice);
+    try testing.expect(alice.id != null);
+    try testing.expectEqualStrings("alice", alice.name);
+
+    const bob = try repo.insert(.{ .name = "bob", .age = @as(?u32, null) });
+    defer freeRow(Person, alloc, bob);
+
+    const found = try repo.find(alice.id.?);
+    try testing.expect(found != null);
+    defer freeRow(Person, alloc, found.?);
+    try testing.expectEqualStrings("alice", found.?.name);
+
+    const by_name = try repo.findBy(.name, "bob");
+    try testing.expect(by_name != null);
+    defer freeRow(Person, alloc, by_name.?);
+
+    try testing.expectEqual(@as(i64, 2), try repo.count());
+
+    try repo.update(alice.id.?, .{ .name = @as([]const u8, "alicia") });
+    const renamed = (try repo.find(alice.id.?)).?;
+    defer freeRow(Person, alloc, renamed);
+    try testing.expectEqualStrings("alicia", renamed.name);
+
+    try repo.delete(bob.id.?);
+    try testing.expectEqual(@as(i64, 1), try repo.count());
+}
+
+test "Query: where eq + ops + orderBy + limit" {
+    const alloc = testing.allocator;
+    var db = try Conn.open(.{ .path = null, .app_defaults = false });
+    defer db.close();
+
+    const repo = Repo(Person).init(&db, alloc);
+    try repo.createTable();
+
+    inline for (.{
+        .{ "a", @as(?u32, 10) },
+        .{ "b", @as(?u32, 20) },
+        .{ "c", @as(?u32, 30) },
+        .{ "d", @as(?u32, 40) },
+    }) |row| {
+        const r = try repo.insert(.{ .name = @as([]const u8, row[0]), .age = row[1] });
+        freeRow(Person, alloc, r);
+    }
+
+    // age >= 20 ordered desc, limit 2
+    const top2 = try repo.query()
+        .where(.{ .age = op.gte(@as(u32, 20)) })
+        .orderBy(.age, .desc)
+        .limit(2)
+        .all();
+    defer repo.freeAll(top2);
+    try testing.expectEqual(@as(usize, 2), top2.len);
+    try testing.expectEqualStrings("d", top2[0].name);
+    try testing.expectEqualStrings("c", top2[1].name);
+
+    // name LIKE 'a%'
+    const a_only = try repo.query()
+        .where(.{ .name = op.like("a%") })
+        .all();
+    defer repo.freeAll(a_only);
+    try testing.expectEqual(@as(usize, 1), a_only.len);
+
+    // count where eq
+    const n = try repo.query().where(.{ .age = @as(?u32, 30) }).count();
+    try testing.expectEqual(@as(i64, 1), n);
+}
+
+test "Query: delete where" {
+    const alloc = testing.allocator;
+    var db = try Conn.open(.{ .path = null, .app_defaults = false });
+    defer db.close();
+
+    const repo = Repo(Person).init(&db, alloc);
+    try repo.createTable();
+    const r1 = try repo.insert(.{ .name = @as([]const u8, "x"), .age = @as(?u32, 5) });
+    freeRow(Person, alloc, r1);
+    const r2 = try repo.insert(.{ .name = @as([]const u8, "y"), .age = @as(?u32, 50) });
+    freeRow(Person, alloc, r2);
+
+    try repo.query().where(.{ .age = op.lt(@as(u32, 10)) }).delete();
+    try testing.expectEqual(@as(i64, 1), try repo.count());
+}
+
+test "StmtCache: execCached + queryCached reuse" {
+    const alloc = testing.allocator;
+    var db = try Conn.open(.{ .path = null, .app_defaults = false });
+    defer db.close();
+    try db.enableCache(alloc);
+
+    try db.execNoArgs("CREATE TABLE t(x INTEGER);", null);
+    for (0..3) |i| {
+        try db.execCached("INSERT INTO t VALUES(?);", .{@as(i64, @intCast(i))}, null);
+    }
+
+    const Row = struct { x: i64 };
+    var it = try db.queryCached(Row, "SELECT x FROM t ORDER BY x;", .{}, alloc, null);
+    defer it.deinit();
+    var sum: i64 = 0;
+    while (try it.next(null)) |row| sum += row.x;
+    try testing.expectEqual(@as(i64, 0 + 1 + 2), sum);
+
+    // Second query reuses same cached stmt — should not double-finalize.
+    var it2 = try db.queryCached(Row, "SELECT x FROM t ORDER BY x;", .{}, alloc, null);
+    defer it2.deinit();
+    var n: usize = 0;
+    while (try it2.next(null)) |_| n += 1;
+    try testing.expectEqual(@as(usize, 3), n);
 }

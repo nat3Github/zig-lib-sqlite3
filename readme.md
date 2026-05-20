@@ -72,6 +72,8 @@ pub fn main() !void {
 
 ## API
 
+### Low-level (raw SQL)
+
 - `Conn.open(opts)` — opens db. `app_defaults: true` enables WAL, NORMAL sync,
   64MB cache, mmap, foreign keys, 5s busy timeout.
 - `Conn.exec(sql, args, diag)` — prepare/bind/step-to-done. `args` is a tuple.
@@ -80,6 +82,8 @@ pub fn main() !void {
 - `Conn.begin() / beginImmediate()` — returns `Tx` with `commit` / `rollback`.
 - `Conn.migrate(&migrations)` — append-only migrations, content-hash protected,
   tracked in `_sqlite_zig_migrations`.
+- `Conn.enableCache(alloc)` + `Conn.execCached` / `queryCached` — statement
+  cache keyed by SQL string. Auto-reset+rebind on reuse.
 - `schema.createTable(T, name)` — CREATE TABLE from struct + optional
   `pub const sqlite = .{ .primary_key, .autoincrement, .unique, .not_null }` decl.
 - `schema.insert(T, name, skip)` — INSERT statement skipping listed fields.
@@ -87,6 +91,45 @@ pub fn main() !void {
 - `freeRow(T, alloc, row)` — releases allocated slice/Blob fields.
 - `Blob` — wrapper to bind/decode `[]const u8` as BLOB instead of TEXT.
 - `Diag` — capture sqlite errcode/extended/errmsg on error.
+
+### ORM (`Repo` / `Query`)
+
+```zig
+const User = struct {
+    id: ?i64,
+    name: []const u8,
+    age: ?u32,
+    pub const sqlite = .{
+        .table = "user",
+        .primary_key = .id,
+        .autoincrement = true,
+        .unique = &.{.name},
+    };
+};
+
+const repo = sql.Repo(User).init(&db, alloc);
+try repo.createTable();
+
+const u = try repo.insert(.{ .name = "alice", .age = @as(?u32, 30) });
+const found = try repo.find(u.id.?);                 // ?User by PK
+const by_name = try repo.findBy(.name, "alice");     // ?User by any field
+const n = try repo.count();
+try repo.update(u.id.?, .{ .name = "alicia" });      // partial update
+try repo.delete(u.id.?);
+
+const adults = try repo.query()
+    .where(.{ .age = sql.op.gte(@as(u32, 18)) })
+    .orderBy(.age, .desc)
+    .limit(10)
+    .all();
+defer repo.freeAll(adults);
+```
+
+**Operators** (`sql.op`): `eq`, `neq`, `lt`, `lte`, `gt`, `gte`, `like`,
+`isNull`, `notNull`. Bare values in `.where(.{...})` mean equality.
+
+**Query builder methods**: `.where(...)`, `.orderBy(.field, .asc/.desc)`,
+`.limit(n)`, `.offset(n)`, `.all()`, `.first()`, `.count()`, `.delete()`.
 
 ## Type mapping
 
