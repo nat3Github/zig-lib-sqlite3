@@ -28,28 +28,31 @@ const Result = struct {
     ops: usize,
     ns: u64,
 
-    pub fn print(self: Result, w: *std.Io.Writer) !void {
+    pub fn print(self: Result) void {
         const s = @as(f64, @floatFromInt(self.ns)) / 1e9;
         const ops_per_sec = @as(f64, @floatFromInt(self.ops)) / s;
-        try w.print("  {s:<40} {d:>10.3} ms  {d:>10.0} ops/sec\n", .{ self.label, s * 1000.0, ops_per_sec });
+        std.debug.print("  {s:<40} {d:>10.3} ms  {d:>10.0} ops/sec\n", .{ self.label, s * 1000.0, ops_per_sec });
     }
 };
 
+fn nowMonoNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
 fn bench(label: []const u8, ops: usize, body: anytype) !Result {
-    var timer = try std.time.Timer.start();
+    const t0 = nowMonoNs();
     try body.run();
-    return .{ .label = label, .ops = ops, .ns = timer.read() };
+    return .{ .label = label, .ops = ops, .ns = nowMonoNs() - t0 };
 }
 
 pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    var gpa: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout_file = std.fs.File.stdout().writer(&stdout_buf);
-    const stdout = &stdout_file.interface;
-    try stdout.print("sqlite3-zig bench (N_INSERT={d} N_QUERY={d})\n\n", .{ N_INSERT, N_QUERY });
+    std.debug.print("sqlite3-zig bench (N_INSERT={d} N_QUERY={d})\n\n", .{ N_INSERT, N_QUERY });
 
     // -------------------------------------------------------------
     // Scenario 1: naive inserts (no txn, no cache) — worst case.
@@ -69,7 +72,7 @@ pub fn main() !void {
             }
         }{ .db_ref = &db };
         const r = try bench("insert no-txn no-cache", N_INSERT, body);
-        try r.print(stdout);
+        r.print();
     }
 
     // -------------------------------------------------------------
@@ -93,7 +96,7 @@ pub fn main() !void {
             }
         }{ .db_ref = &db };
         const r = try bench("insert in 1 txn (no cache)", N_INSERT, body);
-        try r.print(stdout);
+        r.print();
     }
 
     // -------------------------------------------------------------
@@ -118,7 +121,7 @@ pub fn main() !void {
             }
         }{ .db_ref = &db };
         const r = try bench("insert in 1 txn + cached stmt", N_INSERT, body);
-        try r.print(stdout);
+        r.print();
     }
 
     // -------------------------------------------------------------
@@ -143,7 +146,7 @@ pub fn main() !void {
             }
         }{ .repo_ref = repo, .values = buf };
         const r = try bench("repo.insertMany", N_INSERT, body);
-        try r.print(stdout);
+        r.print();
     }
 
     // -------------------------------------------------------------
@@ -183,7 +186,7 @@ pub fn main() !void {
             }
         }{ .db_ref = &dbq, .alloc = alloc };
         const r = try bench("point lookup by PK (cached)", N_QUERY, body);
-        try r.print(stdout);
+        r.print();
     }
 
     // -------------------------------------------------------------
@@ -205,8 +208,7 @@ pub fn main() !void {
             }
         }{ .repo_ref = repo, .alloc = alloc };
         const r = try bench("range scan (between, indexed, limit 50) x100", 100, body);
-        try r.print(stdout);
+        r.print();
     }
 
-    try stdout.flush();
 }

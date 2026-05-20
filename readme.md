@@ -2,7 +2,7 @@
 
 Statically-compiled sqlite3 (3.53.1) with a typed, comptime-driven zig wrapper.
 
-Targets **zig 0.15.2**.
+Targets **zig 0.16.0**.
 
 ## Build
 

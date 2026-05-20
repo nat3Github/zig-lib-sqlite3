@@ -19,6 +19,13 @@ const builtin = std.builtin;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
+/// Unix epoch seconds. Replaces `nowEpochSeconds()` removed in zig 0.16.
+fn nowEpochSeconds() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    return @intCast(ts.sec);
+}
+
 // ============================================================================
 // Errors
 // ============================================================================
@@ -359,7 +366,7 @@ pub const Conn = struct {
             \\);
         , null);
 
-        const now: i64 = std.time.timestamp();
+        const now: i64 = nowEpochSeconds();
         for (migrations, 0..) |sql_text, i| {
             const version: i64 = @intCast(i + 1);
             const hash = sha256(sql_text);
@@ -440,11 +447,14 @@ fn execMulti(self: *Conn, sql_text: []const u8) Error!void {
 pub const Pool = struct {
     conns: []Conn,
     in_use: []bool,
-    mutex: std.Thread.Mutex,
-    cond: std.Thread.Condition,
+    mutex: std.Io.Mutex,
+    cond: std.Io.Condition,
+    io: std.Io,
     alloc: Allocator,
 
-    pub fn init(alloc: Allocator, opts: OpenOptions, size: usize) Error!Pool {
+    /// `io` must outlive the Pool. Use `std.Io.Threaded.init(alloc, .{}).io()`
+    /// for a thread-backed implementation.
+    pub fn init(alloc: Allocator, io: std.Io, opts: OpenOptions, size: usize) Error!Pool {
         if (size == 0) return error.SqliteMisuse;
         const conns = alloc.alloc(Conn, size) catch return error.OutOfMemory;
         errdefer alloc.free(conns);
@@ -461,8 +471,9 @@ pub const Pool = struct {
         return .{
             .conns = conns,
             .in_use = in_use,
-            .mutex = .{},
-            .cond = .{},
+            .mutex = .init,
+            .cond = .init,
+            .io = io,
             .alloc = alloc,
         };
     }
@@ -475,8 +486,8 @@ pub const Pool = struct {
 
     /// Block until a connection is available.
     pub fn acquire(self: *Pool) *Conn {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         while (true) {
             for (self.in_use, 0..) |used, i| {
                 if (!used) {
@@ -484,19 +495,19 @@ pub const Pool = struct {
                     return &self.conns[i];
                 }
             }
-            self.cond.wait(&self.mutex);
+            self.cond.waitUncancelable(self.io, &self.mutex);
         }
     }
 
     pub fn release(self: *Pool, conn: *Conn) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const base = @intFromPtr(self.conns.ptr);
         const offset = @intFromPtr(conn) - base;
         const idx = offset / @sizeOf(Conn);
         std.debug.assert(idx < self.in_use.len);
         self.in_use[idx] = false;
-        self.cond.signal();
+        self.cond.signal(self.io);
     }
 };
 
@@ -1515,7 +1526,7 @@ pub fn Repo(comptime T: type) type {
                 try stmt.bindAny(idx, @field(values, f.name), self.diag);
                 idx += 1;
             }
-            const now: i64 = std.time.timestamp();
+            const now: i64 = nowEpochSeconds();
             if (ts_created != null) {
                 try stmt.bindAny(idx, now, self.diag);
                 idx += 1;
@@ -1617,7 +1628,7 @@ pub fn Repo(comptime T: type) type {
                 idx += 1;
             }
             if (ts_updated != null) {
-                try stmt.bindAny(idx, @as(i64, std.time.timestamp()), self.diag);
+                try stmt.bindAny(idx, @as(i64, nowEpochSeconds()), self.diag);
                 idx += 1;
             }
             _ = try bindPk(stmt, idx, pk_value);
@@ -1633,7 +1644,7 @@ pub fn Repo(comptime T: type) type {
                 var l = try self.lease(sql_text);
                 defer l.deinit();
                 const stmt = l.ptr();
-                try stmt.bindAny(1, @as(i64, std.time.timestamp()), self.diag);
+                try stmt.bindAny(1, @as(i64, nowEpochSeconds()), self.diag);
                 _ = try bindPk(stmt, 2, pk_value);
                 try stmt.execDone(self.diag);
             } else {
@@ -1729,7 +1740,7 @@ pub fn Repo(comptime T: type) type {
                 idx += 1;
             }
             if (ts_updated != null and comptime set_clause.len > 0) {
-                try stmt.bindAny(idx, @as(i64, std.time.timestamp()), self.diag);
+                try stmt.bindAny(idx, @as(i64, nowEpochSeconds()), self.diag);
                 idx += 1;
             }
             try stmt.execDone(self.diag);
@@ -1807,7 +1818,7 @@ pub fn Repo(comptime T: type) type {
             defer l.deinit();
             const stmt = l.ptr();
 
-            const now: i64 = std.time.timestamp();
+            const now: i64 = nowEpochSeconds();
             for (values) |val| {
                 try stmt.reset();
                 stmt.clearBindings();
@@ -2513,7 +2524,11 @@ test "timestamps: created_at + updated_at" {
     try testing.expect(r1.created_at != null);
     try testing.expect(r1.updated_at != null);
 
-    std.Thread.sleep(std.time.ns_per_ms * 1100); // ensure timestamp advances
+    // Ensure timestamp advances. std.Thread.sleep removed in 0.16; use posix.
+    {
+        const req: std.c.timespec = .{ .sec = 1, .nsec = 100 * 1_000_000 };
+        _ = std.c.nanosleep(&req, null);
+    }
     try repo.update(r1.id.?, .{ .name = @as([]const u8, "bar") });
     const r2 = (try repo.find(r1.id.?)).?;
     defer freeRow(Item, alloc, r2);
@@ -2909,7 +2924,10 @@ test "Repo with cache: integration works" {
 
 test "Pool: acquire + release" {
     const alloc = testing.allocator;
-    var pool = try Pool.init(alloc, .{ .path = null, .app_defaults = false }, 2);
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var pool = try Pool.init(alloc, io, .{ .path = null, .app_defaults = false }, 2);
     defer pool.deinit();
     const c1 = pool.acquire();
     const c2 = pool.acquire();
