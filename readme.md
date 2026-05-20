@@ -2,7 +2,7 @@
 
 Statically-compiled sqlite3 (3.53.1) with a typed, comptime-driven zig wrapper.
 
-Targets **zig 0.14.0**.
+Targets **zig 0.15.2**.
 
 ## Build
 
@@ -81,6 +81,7 @@ pub fn main() !void {
 - `Conn.query(Row, sql, args, alloc, diag)` — returns `Iterator(Row)`.
 - `Conn.queryOne(Row, sql, args, alloc, diag)` — single row convenience.
 - `Conn.begin() / beginImmediate()` — returns `Tx` with `commit` / `rollback`.
+  Nested calls create SAVEPOINTs automatically; depth tracked on Conn.
 - `Conn.migrate(&migrations)` — append-only migrations, content-hash protected,
   tracked in `_sqlite_zig_migrations`.
 - `Conn.enableCache(alloc)` + `Conn.execCached` / `queryCached` — statement
@@ -137,6 +138,12 @@ mean equality.
 
 **Repo bulk + convenience**: `.insertMany(V, slice)` (single txn, prepared
 once), `.findOrCreate(.field, lookup, defaults)`.
+
+**Diagnostics**: `repo.withDiag(&diag)` returns a wired copy. All internal
+prepare / bind / exec calls populate `diag.code` + `diag.msg` on error.
+
+**Auto statement cache**: call `conn.enableCache(alloc)` once; all `Repo`
+methods then transparently reuse cached prepared statements per SQL string.
 
 ### Timestamps + soft delete
 
