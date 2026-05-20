@@ -161,9 +161,66 @@ const Item = struct {
 ### Relations
 
 ```zig
+// hasMany: children of a parent
 const posts = try userRepo.hasMany(Post, "user_id", alice.id.?);
 defer postRepo.freeAll(posts);
+
+// belongsTo: parent of a child
+const author = try bookRepo.belongsTo(Author, book.author_id);
+defer if (author) |a| sql.freeRow(Author, alloc, a);
+
+// Batched eager-load: one query for N parents → HashMap keyed by parent PK
+var map = try userRepo.loadChildrenBatched(Post, "user_id", &.{alice, bob});
+defer { var it = map.valueIterator(); while (it.next()) |sp| { postRepo.freeAll(sp.*); } map.deinit(); }
+const alice_posts = map.get(alice.id.?).?;
 ```
+
+### Upsert (INSERT OR UPDATE)
+
+```zig
+const Kv = struct {
+    key: []const u8,
+    val: i64,
+    pub const sqlite = .{ .table = "kv", .primary_key = .key };
+};
+const repo = sql.Repo(Kv).init(&db, alloc);
+const row = try repo.upsert(.{ .key = "x", .val = 42 });
+// Conflict on PK → DO UPDATE SET val = excluded.val; (other non-PK cols too).
+// Honors updated_at timestamp if configured.
+```
+
+### Composite primary key
+
+```zig
+const Edge = struct {
+    from_id: i64,
+    to_id: i64,
+    weight: f64,
+    pub const sqlite = .{
+        .table = "edge",
+        .primary_key = .{ .from_id, .to_id },
+    };
+};
+const e = try repo.find(.{ from_id_val, to_id_val });        // tuple lookup
+try repo.update(.{ from_id_val, to_id_val }, .{ .weight = 0.9 });
+try repo.delete(.{ from_id_val, to_id_val });
+```
+
+### Indexes
+
+```zig
+pub const sqlite = .{
+    ...,
+    .indexes = &.{
+        .{ .cols = &.{.author}, .unique = false },
+        .{ .cols = &.{.email}, .unique = true },
+        .{ .cols = &.{ .user_id, .created_at } },          // composite index
+    },
+};
+```
+
+`Repo.createTable` issues `CREATE TABLE` + one `CREATE INDEX IF NOT EXISTS
+idx_<table>_<cols>` per entry.
 
 ### JSON columns
 

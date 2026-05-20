@@ -827,33 +827,86 @@ pub const schema = struct {
         comptime {
             const fields = @typeInfo(T).@"struct".fields;
             const cfg = if (@hasDecl(T, "sqlite")) T.sqlite else .{};
-            const pk_field: ?[]const u8 = if (@hasField(@TypeOf(cfg), "primary_key"))
-                @tagName(cfg.primary_key)
+            const pk_cols: []const []const u8 = if (@hasField(@TypeOf(cfg), "primary_key"))
+                pkColsFromCfg(cfg.primary_key)
             else
-                null;
+                &.{};
             const ai: bool = if (@hasField(@TypeOf(cfg), "autoincrement")) cfg.autoincrement else false;
             const unique_set: []const []const u8 = if (@hasField(@TypeOf(cfg), "unique")) tagNames(cfg.unique) else &.{};
             const nn_set: []const []const u8 = if (@hasField(@TypeOf(cfg), "not_null")) tagNames(cfg.not_null) else &.{};
+            const composite_pk = pk_cols.len > 1;
 
             var out: []const u8 = "CREATE TABLE IF NOT EXISTS " ++ table_name ++ " (\n";
             for (fields, 0..) |f, i| {
+                const is_single_pk = pk_cols.len == 1 and std.mem.eql(u8, pk_cols[0], f.name);
+                const is_any_pk = containsName(pk_cols, f.name);
                 var line: []const u8 = "  " ++ f.name ++ " " ++ sqlTypeOf(f.type);
-                if (pk_field != null and std.mem.eql(u8, pk_field.?, f.name)) {
+                if (is_single_pk) {
                     line = line ++ " PRIMARY KEY";
                     if (ai) line = line ++ " AUTOINCREMENT";
                 }
                 if (containsName(unique_set, f.name)) line = line ++ " UNIQUE";
-                if (!isNullable(f.type) and !(pk_field != null and std.mem.eql(u8, pk_field.?, f.name))) {
+                if (!isNullable(f.type) and !is_any_pk) {
                     line = line ++ " NOT NULL";
                 } else if (containsName(nn_set, f.name)) {
                     line = line ++ " NOT NULL";
                 }
-                if (i + 1 < fields.len) line = line ++ ",";
+                if (i + 1 < fields.len or composite_pk) line = line ++ ",";
                 out = out ++ line ++ "\n";
+            }
+            if (composite_pk) {
+                var pk_list: []const u8 = "";
+                for (pk_cols, 0..) |pkc, i| {
+                    if (i > 0) pk_list = pk_list ++ ", ";
+                    pk_list = pk_list ++ pkc;
+                }
+                out = out ++ "  PRIMARY KEY (" ++ pk_list ++ ")\n";
             }
             out = out ++ ");";
             return out[0..out.len :0];
         }
+    }
+
+    /// CREATE INDEX statements derived from `T.sqlite.indexes` config. One
+    /// statement per entry; empty list yields a no-op stub.
+    pub fn createIndexes(comptime T: type, comptime table_name: []const u8) []const [:0]const u8 {
+        return comptime blk: {
+            const idxs = entityIndexes(T);
+            var stmts: [idxs.len][:0]const u8 = undefined;
+            for (idxs, 0..) |spec, i| {
+                var cols_list: []const u8 = "";
+                var name_part: []const u8 = "";
+                for (spec.cols, 0..) |col, j| {
+                    if (j > 0) {
+                        cols_list = cols_list ++ ", ";
+                        name_part = name_part ++ "_";
+                    }
+                    cols_list = cols_list ++ col;
+                    name_part = name_part ++ col;
+                }
+                const unique_kw: []const u8 = if (spec.unique) "UNIQUE " else "";
+                const idx_name = "idx_" ++ table_name ++ "_" ++ name_part;
+                const sql_str = "CREATE " ++ unique_kw ++ "INDEX IF NOT EXISTS " ++ idx_name ++ " ON " ++ table_name ++ "(" ++ cols_list ++ ");";
+                stmts[i] = (sql_str ++ "\x00")[0..sql_str.len :0];
+            }
+            const fixed = stmts;
+            break :blk &fixed;
+        };
+    }
+
+    fn pkColsFromCfg(comptime pk: anytype) []const []const u8 {
+        return comptime switch (@typeInfo(@TypeOf(pk))) {
+            .enum_literal => &.{@tagName(pk)},
+            .@"struct" => |s| blk: {
+                var out: [s.fields.len][]const u8 = undefined;
+                for (s.fields, 0..) |f, i| {
+                    out[i] = @tagName(@field(pk, f.name));
+                }
+                const fixed = out;
+                break :blk &fixed;
+            },
+            else => @compileError(".primary_key must be enum literal or tuple of enum literals"),
+        };
     }
 
     fn tagNames(comptime arr: anytype) []const []const u8 {
@@ -1091,9 +1144,97 @@ fn entityTable(comptime T: type) []const u8 {
 }
 
 fn entityPk(comptime T: type) []const u8 {
-    const cfg = T.sqlite;
-    if (@hasField(entityCfg(T), "primary_key")) return @tagName(cfg.primary_key);
-    @compileError(@typeName(T) ++ ": sqlite config missing .primary_key");
+    // Single-PK convenience: returns the lone column name. compileError if composite.
+    const cols = entityPkCols(T);
+    if (cols.len != 1) @compileError(@typeName(T) ++ ": composite primary key — use entityPkCols");
+    return cols[0];
+}
+
+/// Returns one or more PK column names. Supports single (`.primary_key = .id`)
+/// and composite (`.primary_key = .{.user_id, .post_id}`).
+fn entityPkCols(comptime T: type) []const []const u8 {
+    if (!@hasField(entityCfg(T), "primary_key"))
+        @compileError(@typeName(T) ++ ": sqlite config missing .primary_key");
+    const pk = T.sqlite.primary_key;
+    const PK = @TypeOf(pk);
+    return comptime switch (@typeInfo(PK)) {
+        .enum_literal => &.{@tagName(pk)},
+        .@"struct" => |s| blk: {
+            var out: [s.fields.len][]const u8 = undefined;
+            for (s.fields, 0..) |f, i| {
+                out[i] = @tagName(@field(pk, f.name));
+            }
+            const fixed = out;
+            break :blk &fixed;
+        },
+        else => @compileError(@typeName(T) ++ ": .primary_key must be enum literal or tuple of enum literals"),
+    };
+}
+
+/// `c1 = ? AND c2 = ?` for binding PK lookups.
+fn pkWhereFragment(comptime T: type) []const u8 {
+    return comptime blk: {
+        const cols = entityPkCols(T);
+        var s: []const u8 = "";
+        for (cols, 0..) |col, i| {
+            if (i > 0) s = s ++ " AND ";
+            s = s ++ col ++ " = ?";
+        }
+        break :blk s;
+    };
+}
+
+/// Bind a scalar OR tuple `pk_value` to `?1..?N` of `stmt`. Returns next idx.
+fn bindPk(stmt: *Stmt, start_idx: c_int, pk_value: anytype) Error!c_int {
+    const PKV = @TypeOf(pk_value);
+    const info = @typeInfo(PKV);
+    if (info == .@"struct") {
+        var idx = start_idx;
+        inline for (info.@"struct".fields) |f| {
+            try stmt.bindAny(idx, @field(pk_value, f.name), null);
+            idx += 1;
+        }
+        return idx;
+    }
+    try stmt.bindAny(start_idx, pk_value, null);
+    return start_idx + 1;
+}
+
+const IndexSpec = struct { cols: []const []const u8, unique: bool };
+
+fn entityIndexes(comptime T: type) []const IndexSpec {
+    if (!@hasField(entityCfg(T), "indexes")) return &.{};
+    const idx_arr = T.sqlite.indexes;
+    return comptime blk: {
+        const deref = switch (@typeInfo(@TypeOf(idx_arr))) {
+            .pointer => idx_arr.*,
+            else => idx_arr,
+        };
+        const D = @TypeOf(deref);
+        const fields = @typeInfo(D).@"struct".fields;
+        var out: [fields.len]IndexSpec = undefined;
+        for (fields, 0..) |f, i| {
+            const item = @field(deref, f.name);
+            const cols_arr = item.cols;
+            const cols_deref = switch (@typeInfo(@TypeOf(cols_arr))) {
+                .pointer => cols_arr.*,
+                else => cols_arr,
+            };
+            const CD = @TypeOf(cols_deref);
+            const cfields = @typeInfo(CD).@"struct".fields;
+            var cols: [cfields.len][]const u8 = undefined;
+            for (cfields, 0..) |cf, ci| {
+                cols[ci] = @tagName(@field(cols_deref, cf.name));
+            }
+            const fixed_cols = cols;
+            out[i] = .{
+                .cols = &fixed_cols,
+                .unique = if (@hasField(@TypeOf(item), "unique")) item.unique else false,
+            };
+        }
+        const fixed = out;
+        break :blk &fixed;
+    };
 }
 
 fn entityAutoinc(comptime T: type) bool {
@@ -1218,7 +1359,8 @@ pub fn Repo(comptime T: type) type {
 
         const Self = @This();
         const table = entityTable(T);
-        const pk = entityPk(T);
+        const pk_cols = entityPkCols(T);
+        const pk_where = pkWhereFragment(T);
         const all_cols = columnList(T);
         const ts_created = createdAtField(T);
         const ts_updated = updatedAtField(T);
@@ -1292,18 +1434,25 @@ pub fn Repo(comptime T: type) type {
         }
 
         /// Find by primary key value. Honors soft-delete filter.
+        /// For composite PK, pass a tuple `.{a, b}`.
         pub fn find(self: Self, pk_value: anytype) Error!?T {
             const cond = comptime aliveFilter(T);
-            const sql_str = "SELECT " ++ all_cols ++ " FROM " ++ table ++ " WHERE " ++ pk ++ " = ? AND " ++ cond ++ ";";
+            const sql_str = "SELECT " ++ all_cols ++ " FROM " ++ table ++ " WHERE " ++ pk_where ++ " AND " ++ cond ++ ";";
             const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
-            return try self.conn.queryOne(T, sql_text, .{pk_value}, self.alloc, null);
+            var stmt = try self.conn.prepare(sql_text, null);
+            defer stmt.deinit();
+            _ = try bindPk(&stmt, 1, pk_value);
+            return try stepOne(T, &stmt, self.alloc);
         }
 
         /// Find a row including soft-deleted entries.
         pub fn findIncludingDeleted(self: Self, pk_value: anytype) Error!?T {
-            const sql_str = "SELECT " ++ all_cols ++ " FROM " ++ table ++ " WHERE " ++ pk ++ " = ?;";
+            const sql_str = "SELECT " ++ all_cols ++ " FROM " ++ table ++ " WHERE " ++ pk_where ++ ";";
             const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
-            return try self.conn.queryOne(T, sql_text, .{pk_value}, self.alloc, null);
+            var stmt = try self.conn.prepare(sql_text, null);
+            defer stmt.deinit();
+            _ = try bindPk(&stmt, 1, pk_value);
+            return try stepOne(T, &stmt, self.alloc);
         }
 
         fn findRowid(self: Self, rowid: i64) Error!?T {
@@ -1357,7 +1506,7 @@ pub fn Repo(comptime T: type) type {
                     sets = sets ++ u ++ " = ?";
                 }
             }
-            const sql_str = "UPDATE " ++ table ++ " SET " ++ sets ++ " WHERE " ++ pk ++ " = ?;";
+            const sql_str = "UPDATE " ++ table ++ " SET " ++ sets ++ " WHERE " ++ pk_where ++ ";";
             const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
 
             var stmt = try self.conn.prepare(sql_text, null);
@@ -1371,7 +1520,7 @@ pub fn Repo(comptime T: type) type {
                 try stmt.bindAny(idx, @as(i64, std.time.timestamp()), null);
                 idx += 1;
             }
-            try stmt.bindAny(idx, pk_value, null);
+            _ = try bindPk(&stmt, idx, pk_value);
             try stmt.execDone(null);
         }
 
@@ -1379,29 +1528,109 @@ pub fn Repo(comptime T: type) type {
         /// instead of removing. Use `deleteHard` for unconditional removal.
         pub fn delete(self: Self, pk_value: anytype) Error!void {
             if (comptime soft_field) |f| {
-                const sql_str = "UPDATE " ++ table ++ " SET " ++ f ++ " = ? WHERE " ++ pk ++ " = ?;";
+                const sql_str = "UPDATE " ++ table ++ " SET " ++ f ++ " = ? WHERE " ++ pk_where ++ ";";
                 const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
-                try self.conn.exec(sql_text, .{ @as(i64, std.time.timestamp()), pk_value }, null);
+                var stmt = try self.conn.prepare(sql_text, null);
+                defer stmt.deinit();
+                try stmt.bindAny(1, @as(i64, std.time.timestamp()), null);
+                _ = try bindPk(&stmt, 2, pk_value);
+                try stmt.execDone(null);
             } else {
-                const sql_str = "DELETE FROM " ++ table ++ " WHERE " ++ pk ++ " = ?;";
+                const sql_str = "DELETE FROM " ++ table ++ " WHERE " ++ pk_where ++ ";";
                 const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
-                try self.conn.exec(sql_text, .{pk_value}, null);
+                var stmt = try self.conn.prepare(sql_text, null);
+                defer stmt.deinit();
+                _ = try bindPk(&stmt, 1, pk_value);
+                try stmt.execDone(null);
             }
         }
 
         /// Unconditional DELETE FROM, bypassing soft-delete.
         pub fn deleteHard(self: Self, pk_value: anytype) Error!void {
-            const sql_str = "DELETE FROM " ++ table ++ " WHERE " ++ pk ++ " = ?;";
+            const sql_str = "DELETE FROM " ++ table ++ " WHERE " ++ pk_where ++ ";";
             const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
-            try self.conn.exec(sql_text, .{pk_value}, null);
+            var stmt = try self.conn.prepare(sql_text, null);
+            defer stmt.deinit();
+            _ = try bindPk(&stmt, 1, pk_value);
+            try stmt.execDone(null);
         }
 
         /// Clear the soft-delete marker. Compile-time error if soft-delete not configured.
         pub fn restore(self: Self, pk_value: anytype) Error!void {
             const f = comptime soft_field orelse @compileError(@typeName(T) ++ ": restore requires .soft_delete config");
-            const sql_str = "UPDATE " ++ table ++ " SET " ++ f ++ " = NULL WHERE " ++ pk ++ " = ?;";
+            const sql_str = "UPDATE " ++ table ++ " SET " ++ f ++ " = NULL WHERE " ++ pk_where ++ ";";
             const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
-            try self.conn.exec(sql_text, .{pk_value}, null);
+            var stmt = try self.conn.prepare(sql_text, null);
+            defer stmt.deinit();
+            _ = try bindPk(&stmt, 1, pk_value);
+            try stmt.execDone(null);
+        }
+
+        /// Insert OR update on PK conflict. Returns row with PK set.
+        /// `values` must include PK columns when not autoincrement.
+        pub fn upsert(self: Self, values: anytype) Error!T {
+            const V = @TypeOf(values);
+            const v_fields = @typeInfo(V).@"struct".fields;
+            if (v_fields.len == 0) @compileError("upsert: empty values");
+
+            comptime var cols: []const u8 = "";
+            comptime var qs: []const u8 = "";
+            comptime var set_clause: []const u8 = "";
+            comptime {
+                for (v_fields, 0..) |f, i| {
+                    if (i > 0) {
+                        cols = cols ++ ", ";
+                        qs = qs ++ ", ";
+                    }
+                    cols = cols ++ f.name;
+                    qs = qs ++ "?";
+                    // Skip PK columns in DO UPDATE SET.
+                    var is_pk = false;
+                    for (pk_cols) |pc| {
+                        if (std.mem.eql(u8, pc, f.name)) {
+                            is_pk = true;
+                            break;
+                        }
+                    }
+                    if (!is_pk) {
+                        if (set_clause.len > 0) set_clause = set_clause ++ ", ";
+                        set_clause = set_clause ++ f.name ++ " = excluded." ++ f.name;
+                    }
+                }
+                if (ts_updated) |u| {
+                    if (set_clause.len > 0) set_clause = set_clause ++ ", ";
+                    set_clause = set_clause ++ u ++ " = ?";
+                }
+            }
+            const conflict_target = comptime blk: {
+                var s: []const u8 = "";
+                for (pk_cols, 0..) |pc, i| {
+                    if (i > 0) s = s ++ ", ";
+                    s = s ++ pc;
+                }
+                break :blk s;
+            };
+            const sql_str = if (comptime set_clause.len == 0)
+                "INSERT INTO " ++ table ++ "(" ++ cols ++ ") VALUES(" ++ qs ++ ") ON CONFLICT(" ++ conflict_target ++ ") DO NOTHING;"
+            else
+                "INSERT INTO " ++ table ++ "(" ++ cols ++ ") VALUES(" ++ qs ++ ") ON CONFLICT(" ++ conflict_target ++ ") DO UPDATE SET " ++ set_clause ++ ";";
+            const sql_text = comptime (sql_str ++ "\x00")[0..sql_str.len :0];
+
+            var stmt = try self.conn.prepare(sql_text, null);
+            defer stmt.deinit();
+            var idx: c_int = 1;
+            inline for (v_fields) |f| {
+                try stmt.bindAny(idx, @field(values, f.name), null);
+                idx += 1;
+            }
+            if (ts_updated != null and comptime set_clause.len > 0) {
+                try stmt.bindAny(idx, @as(i64, std.time.timestamp()), null);
+                idx += 1;
+            }
+            try stmt.execDone(null);
+
+            const rowid = self.conn.lastInsertRowid();
+            return (try self.findRowid(rowid)) orelse error.SqliteError;
         }
 
         /// Load children where `<fk_field> = parent_pk_value`.
@@ -1418,6 +1647,104 @@ pub fn Repo(comptime T: type) type {
             return try collectAll(ChildT, self.conn, sql_text, .{parent_pk_value}, self.alloc);
         }
 
+        /// Look up the parent referenced by `fk_value` (typically `child.fk_field`).
+        /// Equivalent to `Repo(ParentT).init(...).find(fk_value)` with the same alloc.
+        pub fn belongsTo(self: Self, comptime ParentT: type, fk_value: anytype) Error!?ParentT {
+            const r = Repo(ParentT).init(self.conn, self.alloc);
+            return try r.find(fk_value);
+        }
+
+        /// Batched eager-load: returns map keyed by parent PK → owned slice of children.
+        /// Issues one `WHERE fk IN (...)` query, groups in-memory.
+        /// Caller frees each value slice with the corresponding child repo's `freeAll`
+        /// and the map with `map.deinit()`.
+        pub fn loadChildrenBatched(
+            self: Self,
+            comptime ChildT: type,
+            comptime fk_field: []const u8,
+            parents: []const T,
+        ) Error!std.AutoHashMap(i64, []ChildT) {
+            // Build "?, ?, ?" placeholder list at runtime (length depends on parents.len).
+            var sql_buf = std.ArrayList(u8).init(self.alloc);
+            defer sql_buf.deinit();
+            const child_table = comptime entityTable(ChildT);
+            const child_cols = comptime columnList(ChildT);
+            const cond = comptime aliveFilter(ChildT);
+            sql_buf.appendSlice("SELECT " ++ child_cols ++ " FROM " ++ child_table ++ " WHERE " ++ fk_field ++ " IN (") catch return error.OutOfMemory;
+            if (parents.len == 0) {
+                sql_buf.appendSlice("NULL)") catch return error.OutOfMemory;
+            } else {
+                for (parents, 0..) |_, i| {
+                    if (i > 0) sql_buf.appendSlice(", ") catch return error.OutOfMemory;
+                    sql_buf.append('?') catch return error.OutOfMemory;
+                }
+                sql_buf.append(')') catch return error.OutOfMemory;
+            }
+            sql_buf.appendSlice(" AND ") catch return error.OutOfMemory;
+            sql_buf.appendSlice(cond) catch return error.OutOfMemory;
+            sql_buf.append(';') catch return error.OutOfMemory;
+            sql_buf.append(0) catch return error.OutOfMemory;
+            const sql_text = sql_buf.items[0 .. sql_buf.items.len - 1 :0];
+
+            var stmt = try self.conn.prepare(sql_text, null);
+            defer stmt.deinit();
+            var idx: c_int = 1;
+            for (parents) |p| {
+                const pkv = @field(p, pk_cols[0]); // single-PK only
+                try stmt.bindAny(idx, pkv, null);
+                idx += 1;
+            }
+
+            // Locate fk column index in child row.
+            const fk_col_idx: usize = comptime blk: {
+                for (@typeInfo(ChildT).@"struct".fields, 0..) |f, i| {
+                    if (std.mem.eql(u8, f.name, fk_field)) break :blk i;
+                }
+                @compileError(@typeName(ChildT) ++ " missing field " ++ fk_field);
+            };
+
+            var map = std.AutoHashMap(i64, std.ArrayList(ChildT)).init(self.alloc);
+            errdefer {
+                var it = map.valueIterator();
+                while (it.next()) |v| {
+                    for (v.items) |row| freeRow(ChildT, self.alloc, row);
+                    v.deinit();
+                }
+                map.deinit();
+            }
+            while (true) {
+                const rc = c.sqlite3_step(stmt.stmt);
+                switch (rc) {
+                    c.SQLITE_ROW => {
+                        const row = try decodeRow(ChildT, &stmt, self.alloc);
+                        const key = stmt.columnI64(fk_col_idx);
+                        const gop = map.getOrPut(key) catch return error.OutOfMemory;
+                        if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(ChildT).init(self.alloc);
+                        gop.value_ptr.append(row) catch return error.OutOfMemory;
+                    },
+                    c.SQLITE_DONE => break,
+                    else => try codeToError(rc),
+                }
+            }
+            // Convert ArrayLists to owned slices.
+            var out = std.AutoHashMap(i64, []ChildT).init(self.alloc);
+            errdefer {
+                var it = out.valueIterator();
+                while (it.next()) |slice_ptr| {
+                    for (slice_ptr.*) |row| freeRow(ChildT, self.alloc, row);
+                    self.alloc.free(slice_ptr.*);
+                }
+                out.deinit();
+            }
+            var iter = map.iterator();
+            while (iter.next()) |entry| {
+                const slice = entry.value_ptr.toOwnedSlice() catch return error.OutOfMemory;
+                out.put(entry.key_ptr.*, slice) catch return error.OutOfMemory;
+            }
+            map.deinit();
+            return out;
+        }
+
         /// Free a slice of rows returned by `all` / `query.all`.
         pub fn freeAll(self: Self, rows: []T) void {
             for (rows) |row| freeRow(T, self.alloc, row);
@@ -1428,12 +1755,29 @@ pub fn Repo(comptime T: type) type {
             return QueryBuilder(T).init(self.conn, self.alloc);
         }
 
-        /// Run `CREATE TABLE IF NOT EXISTS` for this entity.
+        /// Run `CREATE TABLE IF NOT EXISTS` + any `CREATE INDEX` from .indexes config.
         pub fn createTable(self: Self) Error!void {
             const ddl = comptime schema.createTable(T, table);
             try self.conn.execNoArgs(ddl, null);
+            const idx_stmts = comptime schema.createIndexes(T, table);
+            inline for (idx_stmts) |stmt| {
+                try self.conn.execNoArgs(stmt, null);
+            }
         }
     };
+}
+
+/// Step a prepared statement once and decode the row, or return null on DONE.
+fn stepOne(comptime Row: type, stmt: *Stmt, alloc: Allocator) Error!?Row {
+    const rc = c.sqlite3_step(stmt.stmt);
+    switch (rc) {
+        c.SQLITE_ROW => return try decodeRow(Row, stmt, alloc),
+        c.SQLITE_DONE => return null,
+        else => {
+            try codeToError(rc);
+            return null;
+        },
+    }
 }
 
 /// Comptime query builder for `Repo(T)`. Methods take comptime spec structs;
@@ -2044,6 +2388,166 @@ test "hasMany relation helper" {
     const books = try ar.hasMany(Book, "author_id", a.id.?);
     defer br.freeAll(books);
     try testing.expectEqual(@as(usize, 3), books.len);
+}
+
+test "upsert: insert then update on conflict" {
+    const alloc = testing.allocator;
+    var db = try Conn.open(.{ .path = null, .app_defaults = false });
+    defer db.close();
+    const Kv = struct {
+        key: []const u8,
+        val: i64,
+        pub const sqlite = .{ .table = "kv", .primary_key = .key };
+    };
+    const repo = Repo(Kv).init(&db, alloc);
+    try repo.createTable();
+    const r1 = try repo.upsert(.{ .key = @as([]const u8, "x"), .val = @as(i64, 1) });
+    defer freeRow(Kv, alloc, r1);
+    const r2 = try repo.upsert(.{ .key = @as([]const u8, "x"), .val = @as(i64, 42) });
+    defer freeRow(Kv, alloc, r2);
+    try testing.expectEqual(@as(i64, 1), try repo.count());
+    const got = (try repo.find(@as([]const u8, "x"))).?;
+    defer freeRow(Kv, alloc, got);
+    try testing.expectEqual(@as(i64, 42), got.val);
+}
+
+test "composite PK: find + update + delete" {
+    const alloc = testing.allocator;
+    var db = try Conn.open(.{ .path = null, .app_defaults = false });
+    defer db.close();
+    const Edge = struct {
+        from_id: i64,
+        to_id: i64,
+        weight: f64,
+        pub const sqlite = .{
+            .table = "edge",
+            .primary_key = .{ .from_id, .to_id },
+        };
+    };
+    const repo = Repo(Edge).init(&db, alloc);
+    try repo.createTable();
+    _ = try repo.insert(.{ .from_id = @as(i64, 1), .to_id = @as(i64, 2), .weight = @as(f64, 0.5) });
+    _ = try repo.insert(.{ .from_id = @as(i64, 1), .to_id = @as(i64, 3), .weight = @as(f64, 0.7) });
+    const e = (try repo.find(.{ @as(i64, 1), @as(i64, 2) })).?;
+    try testing.expectEqual(@as(f64, 0.5), e.weight);
+
+    try repo.update(.{ @as(i64, 1), @as(i64, 2) }, .{ .weight = @as(f64, 0.9) });
+    const after = (try repo.find(.{ @as(i64, 1), @as(i64, 2) })).?;
+    try testing.expectEqual(@as(f64, 0.9), after.weight);
+
+    try repo.delete(.{ @as(i64, 1), @as(i64, 3) });
+    try testing.expectEqual(@as(i64, 1), try repo.count());
+}
+
+test "indexes: createTable applies CREATE INDEX" {
+    const alloc = testing.allocator;
+    var db = try Conn.open(.{ .path = null, .app_defaults = false });
+    defer db.close();
+    const Note = struct {
+        id: ?i64,
+        author: []const u8,
+        title: []const u8,
+        pub const sqlite = .{
+            .table = "note",
+            .primary_key = .id,
+            .autoincrement = true,
+            .indexes = &.{
+                .{ .cols = &.{.author}, .unique = false },
+                .{ .cols = &.{.title}, .unique = true },
+            },
+        };
+    };
+    const repo = Repo(Note).init(&db, alloc);
+    try repo.createTable();
+
+    const CountRow = struct { c: i64 };
+    const r = try db.queryOne(
+        CountRow,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_note_%';",
+        .{},
+        alloc,
+        null,
+    );
+    try testing.expectEqual(@as(i64, 2), r.?.c);
+
+    const first = try repo.insert(.{ .author = @as([]const u8, "a"), .title = @as([]const u8, "T1") });
+    defer freeRow(Note, alloc, first);
+    // UNIQUE index on title should reject duplicate.
+    const dup = repo.insert(.{ .author = @as([]const u8, "b"), .title = @as([]const u8, "T1") });
+    try testing.expectError(error.SqliteConstraint, dup);
+}
+
+test "belongsTo lookup" {
+    const alloc = testing.allocator;
+    var db = try Conn.open(.{ .path = null, .app_defaults = false });
+    defer db.close();
+    const Author = struct {
+        id: ?i64,
+        name: []const u8,
+        pub const sqlite = .{ .table = "author", .primary_key = .id, .autoincrement = true };
+    };
+    const Book = struct {
+        id: ?i64,
+        author_id: i64,
+        title: []const u8,
+        pub const sqlite = .{ .table = "book", .primary_key = .id, .autoincrement = true };
+    };
+    const ar = Repo(Author).init(&db, alloc);
+    const br = Repo(Book).init(&db, alloc);
+    try ar.createTable();
+    try br.createTable();
+    const a = try ar.insert(.{ .name = @as([]const u8, "Tolkien") });
+    defer freeRow(Author, alloc, a);
+    const b = try br.insert(.{ .author_id = a.id.?, .title = @as([]const u8, "Hobbit") });
+    defer freeRow(Book, alloc, b);
+
+    const parent = (try br.belongsTo(Author, b.author_id)).?;
+    defer freeRow(Author, alloc, parent);
+    try testing.expectEqualStrings("Tolkien", parent.name);
+}
+
+test "loadChildrenBatched: one query for N parents" {
+    const alloc = testing.allocator;
+    var db = try Conn.open(.{ .path = null, .app_defaults = false });
+    defer db.close();
+    const Author = struct {
+        id: ?i64,
+        name: []const u8,
+        pub const sqlite = .{ .table = "author", .primary_key = .id, .autoincrement = true };
+    };
+    const Book = struct {
+        id: ?i64,
+        author_id: i64,
+        title: []const u8,
+        pub const sqlite = .{ .table = "book", .primary_key = .id, .autoincrement = true };
+    };
+    const ar = Repo(Author).init(&db, alloc);
+    const br = Repo(Book).init(&db, alloc);
+    try ar.createTable();
+    try br.createTable();
+    const a1 = try ar.insert(.{ .name = @as([]const u8, "A") });
+    defer freeRow(Author, alloc, a1);
+    const a2 = try ar.insert(.{ .name = @as([]const u8, "B") });
+    defer freeRow(Author, alloc, a2);
+    inline for (.{ "x", "y", "z" }) |t| {
+        const b = try br.insert(.{ .author_id = a1.id.?, .title = @as([]const u8, t) });
+        freeRow(Book, alloc, b);
+    }
+    const b_only = try br.insert(.{ .author_id = a2.id.?, .title = @as([]const u8, "lone") });
+    freeRow(Book, alloc, b_only);
+
+    const parents = [_]Author{ a1, a2 };
+    var map = try ar.loadChildrenBatched(Book, "author_id", &parents);
+    defer {
+        var it = map.valueIterator();
+        while (it.next()) |slice_ptr| {
+            for (slice_ptr.*) |row| freeRow(Book, alloc, row);
+            alloc.free(slice_ptr.*);
+        }
+        map.deinit();
+    }
+    try testing.expectEqual(@as(usize, 3), map.get(a1.id.?).?.len);
+    try testing.expectEqual(@as(usize, 1), map.get(a2.id.?).?.len);
 }
 
 test "Pool: acquire + release" {
