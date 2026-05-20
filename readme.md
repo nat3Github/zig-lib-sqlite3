@@ -1,6 +1,6 @@
 # sqlite3-zig
 
-Statically-compiled sqlite3 (3.46.0) with a typed, comptime-driven zig wrapper.
+Statically-compiled sqlite3 (3.53.1) with a typed, comptime-driven zig wrapper.
 
 Targets **zig 0.14.0**.
 
