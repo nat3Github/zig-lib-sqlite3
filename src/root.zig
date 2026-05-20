@@ -9,9 +9,10 @@
 //!
 //! Targets zig 0.14.0.
 
-pub const c = @cImport({
-    @cInclude("sqlite3.h");
-});
+/// sqlite3 C bindings, generated via build-time `translate-c` (see build.zig).
+/// Replaces in-source `@cImport` for forward compatibility — zig has flagged
+/// `@cImport` for removal in favor of the build-step variant.
+pub const c = @import("sqlite3_c");
 
 const std = @import("std");
 const builtin = std.builtin;

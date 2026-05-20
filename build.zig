@@ -7,6 +7,14 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Test the library");
     const bench_step = b.step("bench", "Run benchmarks");
 
+    // translate-c sqlite3.h into a module. Build-time invocation; output cached.
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("sqlite-src/sqlite3.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const c_module = translate_c.createModule();
+
     const sqlite3_module = b.addModule("sqlite3", .{
         .target = target,
         .optimize = optimize,
@@ -16,6 +24,7 @@ pub fn build(b: *std.Build) void {
     sqlite3_module.addIncludePath(b.path("sqlite-src"));
     sqlite3_module.addCSourceFile(.{ .file = b.path("sqlite-src/sqlite3.c") });
     sqlite3_module.addCSourceFile(.{ .file = b.path("src/sqlite_bridge.c") });
+    sqlite3_module.addImport("sqlite3_c", c_module);
 
     const test_lib = b.addTest(.{ .root_module = sqlite3_module });
     const test_lib_run = b.addRunArtifact(test_lib);
